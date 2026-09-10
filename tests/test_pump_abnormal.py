@@ -528,13 +528,14 @@ class TestH7152AnyMessageCapture:
 
 
 class TestStartMqttWildcardSubscribeGating:
-    """TEMPORARY: _start_mqtt only opts an account into the diagnostic
-    `<account_topic>/#` wildcard subscribe attempt
-    (GoveeAwsIotClient._try_wildcard_subscribe) when an H7152 is actually
-    registered — never a default behavior change for every install of this
-    integration. See that method's docstring for why: confirming/ruling out
-    a sibling/child topic under the account's own namespace, now that the
-    account topic itself is proven not to carry humidity.
+    """TEMPORARY, DISABLED: _start_mqtt hardcodes attempt_wildcard_subscribe
+    to False regardless of H7152 registration — a live install saw MQTT go
+    silent (no debug-log entries, a "dropped early" reconnect warning) right
+    after upgrading to the build that enabled it, consistent with AWS IoT
+    kicking the whole session for the unauthorized wildcard rather than
+    cleanly refusing it. See _start_mqtt's comment for what must be fixed
+    before re-enabling. These tests pin the current disabled state so a
+    future change to the gating logic doesn't silently re-enable it.
     """
 
     def _coord(self):
@@ -553,7 +554,7 @@ class TestStartMqttWildcardSubscribeGating:
         return coord, coord_mod
 
     @pytest.mark.asyncio
-    async def test_enabled_when_h7152_registered(self):
+    async def test_disabled_even_when_h7152_registered(self):
         coord, coord_mod = self._coord()
         coord._devices[DEVICE_ID] = _h7152()
 
@@ -568,7 +569,7 @@ class TestStartMqttWildcardSubscribeGating:
         finally:
             coord_mod.GoveeAwsIotClient = original
 
-        assert fake_client_cls.call_args.kwargs["attempt_wildcard_subscribe"] is True
+        assert fake_client_cls.call_args.kwargs["attempt_wildcard_subscribe"] is False
 
     @pytest.mark.asyncio
     async def test_disabled_when_no_h7152_registered(self):

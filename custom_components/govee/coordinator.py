@@ -1671,11 +1671,17 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
         if not self._iot_credentials:
             return
 
-        # TEMPORARY: opt into the diagnostic "#" wildcard subscribe attempt
-        # (see GoveeAwsIotClient._try_wildcard_subscribe) only for accounts
-        # that actually have an H7152 under investigation — never a default
-        # behavior change for every install of this integration.
-        has_h7152 = any(device.supports_pump_abnormal for device in self._devices.values())
+        # TEMPORARY, DISABLED: the "#"-under-account-topic wildcard subscribe
+        # attempt (see GoveeAwsIotClient._try_wildcard_subscribe) is suspected
+        # of causing AWS IoT to drop the whole session rather than cleanly
+        # refuse the extra subscription — a live install saw MQTT go silent
+        # (no debug-log entries, a "dropped early" reconnect warning) right
+        # after upgrading to the build that enabled this. Hardcoded off
+        # pending confirmation; do not re-enable by flipping this back to the
+        # supports_pump_abnormal check without first fixing the underlying
+        # cause (e.g. attempting it at most once ever, not on every
+        # reconnect, and/or verifying it doesn't get the session kicked).
+        has_h7152 = False
 
         self._mqtt_client = GoveeAwsIotClient(
             credentials=self._iot_credentials,
