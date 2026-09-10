@@ -46,6 +46,11 @@ _SENSOR_HUMIDITY_MQTT_KEYS = (
     "hum",
 )
 
+# See GoveeDeviceState.update_temperature_from_frames for the derivation and
+# caveats — empirically fit, pump-model dehumidifiers (H7152) only.
+_PUMP_DEHUMIDIFIER_TEMP_FRAME_SLOPE_C = 0.025327
+_PUMP_DEHUMIDIFIER_TEMP_FRAME_INTERCEPT_C = 19.6129
+
 
 def _coerce_int(value: Any) -> int | None:
     """int(value), or None when value is empty/None/non-numeric.
@@ -679,7 +684,7 @@ class GoveeDeviceState:
         """Apply the pump-fault flag an H7152 carries in its AWS IoT push.
 
         Reverse-engineered from a live clogged-drain capture: the app's
-        "Pump Abnormality" alert corresponds to byte offset 11 of an
+        "Pump Abnormality" alert corresponds to byte offset 12 of an
         ``aa 17`` status frame in the push's ``op.command`` list — ``0x00``
         normally, ``0x01`` while the fault is active, back to ``0x00`` once
         it clears. Confirmed against three captures (before / during / after
@@ -696,8 +701,52 @@ class GoveeDeviceState:
             True if the frame was recognised.
         """
         for raw in frames:
-            if len(raw) >= 12 and raw[0] == 0xAA and raw[1] == 0x17:
-                self.pump_abnormal = raw[11] == 0x01
+            if len(raw) >= 13 and raw[0] == 0xAA and raw[1] == 0x17:
+                self.pump_abnormal = raw[12] == 0x01
+                return True
+        return False
+
+    def update_temperature_from_frames(self, frames: Iterable[bytes]) -> bool:
+        """Apply the live temperature reading a pump-model dehumidifier
+        (H7152) carries in its AWS IoT push — provisional, pending refinement.
+
+        The H7152 has no ``sensorTemperature`` capability at all (confirmed:
+        absent from the discovered capabilities list even though the app
+        shows a live reading) — the app's temp/humidity/dew-point/pressure
+        readout is BLE-adjacent but reachable remotely, so it travels over
+        this same AWS IoT push, not local BLE (see the H7150/H7152 section of
+        ``docs/govee-protocol-reference.md``).
+
+        Byte offset 4 of the ``aa 10 81 03`` frame in ``op.command`` was
+        found to correlate near-linearly with the app's displayed
+        temperature: least-squares fit over 5 real (app-screenshot +
+        diagnostics) capture pairs on 2026-09-10, spanning 20.9-22.4°C,
+        residuals 2-4 raw counts (~0.05-0.1°C) — small enough to be
+        capture-timing/display-rounding noise rather than a bad fit. NOT
+        validated outside that narrow range and the exact slope/intercept may
+        drift as more real-world data comes in; compare against the app's own
+        temperature history to refine.
+
+        Byte offset 5 of the same frame does not correlate with humidity,
+        dew point, or pressure in any of the 5 samples — still unidentified.
+
+        Args:
+            frames: Decoded (not base64) frames from ``op.command``.
+
+        Returns:
+            True if the frame was recognised.
+        """
+        for raw in frames:
+            if (
+                len(raw) >= 6
+                and raw[0] == 0xAA
+                and raw[1] == 0x10
+                and raw[2] == 0x81
+                and raw[3] == 0x03
+            ):
+                self.sensor_temperature = round(
+                    _PUMP_DEHUMIDIFIER_TEMP_FRAME_SLOPE_C * raw[4] + _PUMP_DEHUMIDIFIER_TEMP_FRAME_INTERCEPT_C, 1
+                )
                 return True
         return False
 
