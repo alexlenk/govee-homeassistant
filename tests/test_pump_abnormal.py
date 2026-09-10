@@ -525,3 +525,122 @@ class TestH7152AnyMessageCapture:
 
         lines = self._lines(log_path)
         assert len(lines[0]["payload"]) == 8192
+
+
+class TestStartMqttWildcardSubscribeGating:
+    """TEMPORARY: _start_mqtt only opts an account into the diagnostic "#"
+    wildcard subscribe attempt (GoveeAwsIotClient._try_wildcard_subscribe)
+    when an H7152 is actually registered — never a default behavior change
+    for every install of this integration. See that method's docstring for
+    why: confirming/ruling out a device-shadow-style topic humidity might
+    ride, now that the account topic itself is proven not to carry it.
+    """
+
+    def _coord(self):
+        import custom_components.govee.coordinator as coord_mod
+
+        hass = MagicMock()
+        config_entry = MagicMock()
+        config_entry.entry_id = "test_entry"
+        coord = coord_mod.GoveeCoordinator(
+            hass=hass,
+            config_entry=config_entry,
+            api_client=MagicMock(),
+            iot_credentials=MagicMock(),
+            poll_interval=60,
+        )
+        return coord, coord_mod
+
+    @pytest.mark.asyncio
+    async def test_enabled_when_h7152_registered(self):
+        coord, coord_mod = self._coord()
+        coord._devices[DEVICE_ID] = _h7152()
+
+        fake_client_cls = MagicMock()
+        fake_instance = fake_client_cls.return_value
+        fake_instance.available = False  # short-circuits async_start entirely
+
+        original = coord_mod.GoveeAwsIotClient
+        coord_mod.GoveeAwsIotClient = fake_client_cls
+        try:
+            await coord._start_mqtt()
+        finally:
+            coord_mod.GoveeAwsIotClient = original
+
+        assert fake_client_cls.call_args.kwargs["attempt_wildcard_subscribe"] is True
+
+    @pytest.mark.asyncio
+    async def test_disabled_when_no_h7152_registered(self):
+        coord, coord_mod = self._coord()
+        coord._devices[_h7150().device_id] = _h7150()
+
+        fake_client_cls = MagicMock()
+        fake_instance = fake_client_cls.return_value
+        fake_instance.available = False
+
+        original = coord_mod.GoveeAwsIotClient
+        coord_mod.GoveeAwsIotClient = fake_client_cls
+        try:
+            await coord._start_mqtt()
+        finally:
+            coord_mod.GoveeAwsIotClient = original
+
+        assert fake_client_cls.call_args.kwargs["attempt_wildcard_subscribe"] is False
+
+    @pytest.mark.asyncio
+    async def test_disabled_when_no_devices_at_all(self):
+        coord, coord_mod = self._coord()
+
+        fake_client_cls = MagicMock()
+        fake_instance = fake_client_cls.return_value
+        fake_instance.available = False
+
+        original = coord_mod.GoveeAwsIotClient
+        coord_mod.GoveeAwsIotClient = fake_client_cls
+        try:
+            await coord._start_mqtt()
+        finally:
+            coord_mod.GoveeAwsIotClient = original
+
+        assert fake_client_cls.call_args.kwargs["attempt_wildcard_subscribe"] is False
+
+
+class TestTryWildcardSubscribe:
+    """TEMPORARY: GoveeAwsIotClient._try_wildcard_subscribe must never raise
+    or otherwise affect the already-established primary MQTT session,
+    regardless of the SUBACK outcome — it's a best-effort diagnostic only.
+    """
+
+    def _client(self):
+        import custom_components.govee.api.mqtt as mqtt_mod
+
+        return mqtt_mod.GoveeAwsIotClient(
+            credentials=MagicMock(),
+            on_state_update=MagicMock(),
+        )
+
+    @pytest.mark.asyncio
+    async def test_granted_does_not_raise(self):
+        client = self._client()
+        fake_aws_client = MagicMock()
+        fake_aws_client.subscribe = AsyncMock(return_value=(0,))
+
+        await client._try_wildcard_subscribe(fake_aws_client)  # must not raise
+
+        fake_aws_client.subscribe.assert_awaited_once_with("#", qos=0)
+
+    @pytest.mark.asyncio
+    async def test_refused_does_not_raise(self):
+        client = self._client()
+        fake_aws_client = MagicMock()
+        fake_aws_client.subscribe = AsyncMock(return_value=(0x80,))
+
+        await client._try_wildcard_subscribe(fake_aws_client)  # must not raise
+
+    @pytest.mark.asyncio
+    async def test_exception_does_not_propagate(self):
+        client = self._client()
+        fake_aws_client = MagicMock()
+        fake_aws_client.subscribe = AsyncMock(side_effect=RuntimeError("boom"))
+
+        await client._try_wildcard_subscribe(fake_aws_client)  # must not raise

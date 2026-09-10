@@ -347,6 +347,7 @@ class GoveeAwsIotClient:
         on_disconnected: Callable[[], None] | None = None,
         on_raw_message: RawMessageCallback | None = None,
         on_any_message: AnyMessageCallback | None = None,
+        attempt_wildcard_subscribe: bool = False,
     ) -> None:
         """Initialize the AWS IoT MQTT client.
 
@@ -367,6 +368,13 @@ class GoveeAwsIotClient:
             on_disconnected: Optional callback fired when a live session
                 drops, so status entities reflect it immediately instead of
                 on the next poll.
+            attempt_wildcard_subscribe: TEMPORARY diagnostic. If True, also
+                subscribes to the bare "#" wildcard after the normal account
+                topic is up, purely to observe whether AWS IoT's per-cert
+                policy allows seeing traffic beyond that one topic (e.g. a
+                device-shadow-style topic humidity might ride instead). See
+                _try_wildcard_subscribe's docstring. Defaults to False — most
+                installs have no reason to probe beyond the account topic.
         """
         self._credentials = credentials
         self._on_state_update = on_state_update
@@ -375,6 +383,7 @@ class GoveeAwsIotClient:
         self._on_disconnected = on_disconnected
         self._on_raw_message = on_raw_message
         self._on_any_message = on_any_message
+        self._attempt_wildcard_subscribe = attempt_wildcard_subscribe
         self._running = False
         self._connected = False
         self._task: asyncio.Task[None] | None = None
@@ -598,6 +607,53 @@ class GoveeAwsIotClient:
             )
         return self._ssl_context
 
+    async def _try_wildcard_subscribe(self, client: Any) -> None:
+        """TEMPORARY diagnostic: subscribe to bare "#" alongside the account
+        topic, to check whether AWS IoT's per-certificate policy allows
+        seeing traffic beyond the single account topic this integration
+        normally listens to.
+
+        Motivation: the H7152 humidity investigation confirmed (by capturing
+        the complete, untouched wire JSON of every message) that live
+        humidity is genuinely absent from the account topic. AWS IoT commonly
+        splits state across multiple topics — e.g. a device-shadow-style
+        topic (``$aws/things/<thing-name>/shadow/...``) for "current full
+        device state", architecturally distinct from the account's event
+        topic — so humidity could live entirely outside what this
+        integration has ever looked at. A multi-tenant broker like AWS IoT
+        normally scopes each certificate's policy tightly for account
+        isolation, so the expected, and perfectly informative, outcome here
+        is a refused SUBACK (0x80) — that alone confirms wildcard discovery
+        isn't viable and the specific topic would need to be known/derived
+        instead.
+
+        Best-effort only, called only once the primary account-topic
+        subscription is already confirmed healthy: any failure here (refused
+        SUBACK or a raised exception) must never affect that established
+        session. QoS 0 — this is throwaway diagnostic traffic, not state that
+        needs delivery guarantees. Remove once the H7152 humidity
+        investigation concludes either way.
+        """
+        try:
+            granted = await client.subscribe("#", qos=0)
+        except Exception as err:  # noqa: BLE001 — diagnostic only, must not break the session
+            _LOGGER.info("Wildcard '#' subscription attempt failed: %s", err)
+            return
+        if _subscription_refused(granted):
+            _LOGGER.info(
+                "Wildcard '#' subscription refused by AWS IoT policy (SUBACK %r) — "
+                "account is scoped to its own topic, as expected for a multi-tenant "
+                "broker",
+                granted,
+            )
+        else:
+            _LOGGER.info(
+                "Wildcard '#' subscription GRANTED (SUBACK %r) — traffic beyond the "
+                "account topic may now be visible; watch the H7152 debug log for "
+                "unfamiliar topics",
+                granted,
+            )
+
     async def _connection_loop(self) -> None:
         """Maintain the AWS IoT MQTT connection; never stops retrying.
 
@@ -643,6 +699,9 @@ class GoveeAwsIotClient:
                         raise aiomqtt.MqttError(
                             f"account topic subscription refused (SUBACK {granted!r})"
                         )
+
+                    if self._attempt_wildcard_subscribe:
+                        await self._try_wildcard_subscribe(client)
 
                     self._connected = True
                     session_started = time.monotonic()

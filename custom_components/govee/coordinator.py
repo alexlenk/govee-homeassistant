@@ -1671,6 +1671,12 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
         if not self._iot_credentials:
             return
 
+        # TEMPORARY: opt into the diagnostic "#" wildcard subscribe attempt
+        # (see GoveeAwsIotClient._try_wildcard_subscribe) only for accounts
+        # that actually have an H7152 under investigation — never a default
+        # behavior change for every install of this integration.
+        has_h7152 = any(device.supports_pump_abnormal for device in self._devices.values())
+
         self._mqtt_client = GoveeAwsIotClient(
             credentials=self._iot_credentials,
             on_state_update=self._on_mqtt_state_update,
@@ -1679,6 +1685,7 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
             on_disconnected=self._on_mqtt_disconnected,
             on_raw_message=self._on_mqtt_raw_message,
             on_any_message=self._on_mqtt_any_message,
+            attempt_wildcard_subscribe=has_h7152,
         )
 
         if self._mqtt_client.available:
