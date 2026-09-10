@@ -3622,6 +3622,13 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
                     state.battery = existing_state.battery
                 if existing_state.water_full is not None and state.water_full is None:
                     state.water_full = existing_state.water_full
+                # Pump-abnormal (H7152) is decoded only from AWS IoT push frames
+                # (see update_pump_abnormal_from_frames) — the Developer poll has
+                # no field for it at all, so the fresh state has None. Preserve
+                # the push-derived value across the poll or the sensor flickers
+                # to "unknown" every poll cycle (same class of bug as #118/#124).
+                if existing_state.pump_abnormal is not None and state.pump_abnormal is None:
+                    state.pump_abnormal = existing_state.pump_abnormal
                 # Occupancy (H5127) is a momentary push event; the developer
                 # /device/state poll returns only `online` for it (never the
                 # bodyAppearedEvent value), so the fresh state has presence=None.

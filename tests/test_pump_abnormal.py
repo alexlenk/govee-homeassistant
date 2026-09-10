@@ -11,6 +11,9 @@ actual fault).
 """
 
 from __future__ import annotations
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
 
 from custom_components.govee.models import GoveeCapability, GoveeDevice, GoveeDeviceState
 from custom_components.govee.models.device import CAPABILITY_ON_OFF, INSTANCE_POWER
@@ -93,3 +96,68 @@ class TestUpdatePumpAbnormalFromFrames:
         frames = [FRAME_UNRELATED, FRAME_PUMP_ABNORMAL]
         assert state.update_pump_abnormal_from_frames(frames) is True
         assert state.pump_abnormal is True
+
+
+class TestPumpAbnormalPreservedAcrossDeveloperPoll:
+    """The Developer /device/state poll has no field for this at all — it
+    only ever comes from AWS IoT push frames — so a naive poll would flicker
+    the sensor to "unknown" every ~60s (same bug class as water_full/presence,
+    issues #118/#124; caught live on a real device where the entity flapped
+    OK/Unknown every poll cycle after the initial implementation).
+    """
+
+    def _coord(self):
+        import custom_components.govee.coordinator as coord_mod
+
+        hass = MagicMock()
+        config_entry = MagicMock()
+        config_entry.entry_id = "test_entry"
+        config_entry.async_create_background_task = MagicMock()
+        coord = coord_mod.GoveeCoordinator(
+            hass=hass,
+            config_entry=config_entry,
+            api_client=MagicMock(),
+            iot_credentials=None,
+            poll_interval=60,
+        )
+        coord._devices[DEVICE_ID] = GoveeDevice(
+            device_id=DEVICE_ID,
+            sku="H7152",
+            name="Smart Dehumidifier Max",
+            device_type="devices.types.dehumidifier",
+            capabilities=(GoveeCapability(type=CAPABILITY_ON_OFF, instance=INSTANCE_POWER, parameters={}),),
+            is_group=False,
+        )
+        return coord
+
+    @pytest.mark.asyncio
+    async def test_fault_survives_a_poll_that_knows_nothing_about_it(self):
+        coord = self._coord()
+        existing = GoveeDeviceState.create_empty(DEVICE_ID)
+        existing.pump_abnormal = True
+        coord._states[DEVICE_ID] = existing
+
+        # What the Developer poll actually returns: no pump_abnormal field at
+        # all, so the fresh state has it as None.
+        fresh = GoveeDeviceState.create_empty(DEVICE_ID)
+        coord._api_client.get_device_state = AsyncMock(return_value=fresh)
+
+        result = await coord._fetch_device_state(DEVICE_ID, coord._devices[DEVICE_ID])
+
+        assert result.pump_abnormal is True
+
+    @pytest.mark.asyncio
+    async def test_recovery_is_not_masked_by_a_stale_preserved_value(self):
+        """Preservation only fills a None gap — it must never overwrite a
+        push-derived value the poll legitimately doesn't touch."""
+        coord = self._coord()
+        existing = GoveeDeviceState.create_empty(DEVICE_ID)
+        existing.pump_abnormal = False
+        coord._states[DEVICE_ID] = existing
+
+        fresh = GoveeDeviceState.create_empty(DEVICE_ID)
+        coord._api_client.get_device_state = AsyncMock(return_value=fresh)
+
+        result = await coord._fetch_device_state(DEVICE_ID, coord._devices[DEVICE_ID])
+
+        assert result.pump_abnormal is False
