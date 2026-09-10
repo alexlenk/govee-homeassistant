@@ -205,6 +205,14 @@ CkcO8DdZEv8tmZQoTipPNU0zWgIxAOp1AE47xDqUEpHJWEadIRNyp4iciuRMStuW
 # Type for state update callback
 StateUpdateCallback = Callable[[str, dict[str, Any]], None]
 GiveUpCallback = Callable[[int, str], None]
+# device_id, raw parsed JSON payload, decoded op.command frames (not base64).
+# Fires for EVERY inbound message regardless of cmd (status/multiSync/ptReal/
+# unrecognised) — unlike on_state_update, which only fires for the "status"
+# shape. TEMPORARY: added for the H7152 reverse-engineering debug log (see
+# GoveeCoordinator._log_h7152_debug_frame) — multiSync/ptReal never reach
+# on_state_update at all (they return early below), so without this hook
+# any signal riding those message types would be invisible to that log.
+RawMessageCallback = Callable[[str, dict[str, Any], list[bytes]], None]
 """Invoked when the reconnect loop exhausts MAX_RECONNECT_ATTEMPTS.
 Args: (attempts_made, last_error_message)."""
 
@@ -327,6 +335,7 @@ class GoveeAwsIotClient:
         on_give_up: GiveUpCallback | None = None,
         on_connected: Callable[[], None] | None = None,
         on_disconnected: Callable[[], None] | None = None,
+        on_raw_message: RawMessageCallback | None = None,
     ) -> None:
         """Initialize the AWS IoT MQTT client.
 
@@ -336,6 +345,9 @@ class GoveeAwsIotClient:
             on_give_up: Optional callback fired ONCE when MAX_RECONNECT_ATTEMPTS
                 consecutive attempts have failed. Use to surface a repair
                 issue; the loop keeps retrying regardless.
+            on_raw_message: Optional callback(device_id, data, frames) fired
+                for every inbound message regardless of cmd — see
+                RawMessageCallback's docstring.
             on_connected: Optional callback fired after every successful
                 CONNACK + SUBACK, so the caller can clear that repair issue.
             on_disconnected: Optional callback fired when a live session
@@ -347,6 +359,7 @@ class GoveeAwsIotClient:
         self._on_give_up = on_give_up
         self._on_connected = on_connected
         self._on_disconnected = on_disconnected
+        self._on_raw_message = on_raw_message
         self._running = False
         self._connected = False
         self._task: asyncio.Task[None] | None = None
@@ -844,6 +857,16 @@ class GoveeAwsIotClient:
                     and _fb[2] in (0x00, 0x01)
                 ):
                     self._fan_swing_tail[device_id] = list(_fb[3:7])
+
+            # Fires for every message shape (status/multiSync/ptReal/other),
+            # before any cmd-based branch can return early — see
+            # RawMessageCallback's docstring. Never let a debug hook break
+            # real message handling.
+            if self._on_raw_message is not None:
+                try:
+                    self._on_raw_message(device_id, data, frames)
+                except Exception as err:  # noqa: BLE001 — debug hook, must not break MQTT
+                    _LOGGER.debug("on_raw_message callback failed: %s", err)
 
             cmd = data.get("cmd")
 

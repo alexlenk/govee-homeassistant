@@ -1677,6 +1677,7 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
             on_give_up=self._on_mqtt_give_up,
             on_connected=self._on_mqtt_connected,
             on_disconnected=self._on_mqtt_disconnected,
+            on_raw_message=self._on_mqtt_raw_message,
         )
 
         if self._mqtt_client.available:
@@ -3244,6 +3245,47 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
         )
         async_dispatcher_send(self.hass, f"{DOMAIN}_leak_update")
         self._schedule_bff_leak_poll()
+
+    @callback
+    def _on_mqtt_raw_message(self, device_id: str, data: dict[str, Any], frames: list[bytes]) -> None:
+        """TEMPORARY: fan-out for EVERY inbound MQTT message, not just "status".
+
+        _on_mqtt_state_update (via _log_h7152_debug_frame) already logs
+        status pushes with their decoded sensor_temperature/pump_abnormal
+        values — this covers everything ELSE (multiSync, ptReal, any other
+        cmd), which never reaches that handler at all. The H7152 debug log
+        needs that coverage in case humidity or the tank-vs-pump-mode signal
+        rides one of those instead of a status push. Remove alongside the
+        rest of the H7152 debug-log scaffolding.
+        """
+        if data.get("cmd") == "status":
+            return  # already logged, with decoded values, by _on_mqtt_state_update
+        device = self._devices.get(device_id)
+        if device is None or not device.supports_pump_abnormal:
+            return
+        self._config_entry.async_create_background_task(
+            self.hass,
+            self._log_h7152_debug_raw_message(data, frames),
+            name="govee_h7152_debug_log_raw",
+        )
+
+    async def _log_h7152_debug_raw_message(self, data: dict[str, Any], frames: list[bytes]) -> None:
+        """TEMPORARY: sibling of _log_h7152_debug_frame for non-status pushes
+        (multiSync, ptReal, anything else) — see _on_mqtt_raw_message.
+        """
+        await self._append_h7152_debug_line(
+            {
+                "source": "mqtt_raw",
+                "ts": dt_util.utcnow().isoformat(),
+                "cmd": data.get("cmd"),
+                "type": data.get("type"),
+                "sta": data.get("sta"),
+                "onOff": data.get("onOff"),
+                "result": data.get("result"),
+                "op_frames_hex": [f.hex() for f in frames],
+                "state": data.get("state"),
+            }
+        )
 
     @callback
     def _on_mqtt_state_update(self, device_id: str, state_data: dict[str, Any]) -> None:
