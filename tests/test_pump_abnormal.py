@@ -528,12 +528,13 @@ class TestH7152AnyMessageCapture:
 
 
 class TestStartMqttWildcardSubscribeGating:
-    """TEMPORARY: _start_mqtt only opts an account into the diagnostic "#"
-    wildcard subscribe attempt (GoveeAwsIotClient._try_wildcard_subscribe)
-    when an H7152 is actually registered — never a default behavior change
-    for every install of this integration. See that method's docstring for
-    why: confirming/ruling out a device-shadow-style topic humidity might
-    ride, now that the account topic itself is proven not to carry it.
+    """TEMPORARY: _start_mqtt only opts an account into the diagnostic
+    `<account_topic>/#` wildcard subscribe attempt
+    (GoveeAwsIotClient._try_wildcard_subscribe) when an H7152 is actually
+    registered — never a default behavior change for every install of this
+    integration. See that method's docstring for why: confirming/ruling out
+    a sibling/child topic under the account's own namespace, now that the
+    account topic itself is proven not to carry humidity.
     """
 
     def _coord(self):
@@ -614,8 +615,10 @@ class TestTryWildcardSubscribe:
     def _client(self):
         import custom_components.govee.api.mqtt as mqtt_mod
 
+        credentials = MagicMock()
+        credentials.account_topic = "GA/account"
         return mqtt_mod.GoveeAwsIotClient(
-            credentials=MagicMock(),
+            credentials=credentials,
             on_state_update=MagicMock(),
         )
 
@@ -627,7 +630,10 @@ class TestTryWildcardSubscribe:
 
         await client._try_wildcard_subscribe(fake_aws_client)  # must not raise
 
-        fake_aws_client.subscribe.assert_awaited_once_with("#", qos=0)
+        # Scoped under the account's own topic — NOT a bare "#", which would
+        # ask for every topic on the whole regional endpoint and tell us
+        # nothing about this account's own policy.
+        fake_aws_client.subscribe.assert_awaited_once_with("GA/account/#", qos=0)
 
     @pytest.mark.asyncio
     async def test_refused_does_not_raise(self):

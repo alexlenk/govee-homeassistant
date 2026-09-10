@@ -200,7 +200,7 @@ class TestReconnectPolicy:
         _client, fake, _ = await run_loop(sessions, stop_after_sleeps=1, attempt_wildcard_subscribe=True)
         assert fake.clients[0].subscribe.await_args_list == [
             call("GA/account", qos=1),
-            call("#", qos=0),
+            call("GA/account/#", qos=0),
         ]
 
     @pytest.mark.asyncio

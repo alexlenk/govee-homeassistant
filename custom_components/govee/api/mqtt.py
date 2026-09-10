@@ -369,10 +369,10 @@ class GoveeAwsIotClient:
                 drops, so status entities reflect it immediately instead of
                 on the next poll.
             attempt_wildcard_subscribe: TEMPORARY diagnostic. If True, also
-                subscribes to the bare "#" wildcard after the normal account
+                subscribes to `<account_topic>/#` after the normal account
                 topic is up, purely to observe whether AWS IoT's per-cert
-                policy allows seeing traffic beyond that one topic (e.g. a
-                device-shadow-style topic humidity might ride instead). See
+                policy allows seeing sibling/child topics under the
+                account's own namespace beyond that one exact topic. See
                 _try_wildcard_subscribe's docstring. Defaults to False — most
                 installs have no reason to probe beyond the account topic.
         """
@@ -608,24 +608,37 @@ class GoveeAwsIotClient:
         return self._ssl_context
 
     async def _try_wildcard_subscribe(self, client: Any) -> None:
-        """TEMPORARY diagnostic: subscribe to bare "#" alongside the account
-        topic, to check whether AWS IoT's per-certificate policy allows
-        seeing traffic beyond the single account topic this integration
-        normally listens to.
+        """TEMPORARY diagnostic: subscribe to ``<account_topic>/#`` alongside
+        the account topic itself, to check whether AWS IoT's per-certificate
+        policy allows seeing sibling/child topics under the account's own
+        namespace that this integration doesn't otherwise subscribe to.
+
+        Scoped under the account's own topic, NOT a bare "#" — a bare "#"
+        asks for literally every topic on the whole regional AWS IoT
+        endpoint (every other Govee customer's traffic, every other AWS IoT
+        tenant sharing that endpoint), which essentially no sanely-configured
+        multi-tenant policy grants; a refusal there would confirm nothing
+        about this account's own policy. ``<account_topic>/#`` asks only for
+        topics AWS IoT policies commonly group under: even if the specific
+        subtopic name is unknown, an account's own certificate is
+        occasionally scoped with a wildcard resource under its own topic
+        root rather than an exact match, which a scoped probe can reveal and
+        a global one cannot distinguish from a blanket denial.
 
         Motivation: the H7152 humidity investigation confirmed (by capturing
         the complete, untouched wire JSON of every message) that live
-        humidity is genuinely absent from the account topic. AWS IoT commonly
-        splits state across multiple topics — e.g. a device-shadow-style
-        topic (``$aws/things/<thing-name>/shadow/...``) for "current full
-        device state", architecturally distinct from the account's event
-        topic — so humidity could live entirely outside what this
-        integration has ever looked at. A multi-tenant broker like AWS IoT
-        normally scopes each certificate's policy tightly for account
-        isolation, so the expected, and perfectly informative, outcome here
-        is a refused SUBACK (0x80) — that alone confirms wildcard discovery
-        isn't viable and the specific topic would need to be known/derived
-        instead.
+        humidity is genuinely absent from the account topic itself. AWS IoT
+        commonly splits state across multiple topics — e.g. a device-shadow-
+        style topic (``$aws/things/<thing-name>/shadow/...``) for "current
+        full device state" — but that lives under an entirely different root
+        (``$aws/...``, not under the account topic at all), so this probe
+        cannot find a shadow topic even if granted; it only tests for
+        siblings/children of the account's own topic. The expected, still
+        fully informative, outcome is a refused SUBACK (0x80) — multi-tenant
+        account isolation working as intended — which rules out an
+        easy-to-reach second topic under the same root and leaves a shadow
+        topic (needing its thing name derived some other way) as the
+        remaining candidate.
 
         Best-effort only, called only once the primary account-topic
         subscription is already confirmed healthy: any failure here (refused
@@ -634,23 +647,26 @@ class GoveeAwsIotClient:
         needs delivery guarantees. Remove once the H7152 humidity
         investigation concludes either way.
         """
+        wildcard_topic = f"{self._credentials.account_topic}/#"
         try:
-            granted = await client.subscribe("#", qos=0)
+            granted = await client.subscribe(wildcard_topic, qos=0)
         except Exception as err:  # noqa: BLE001 — diagnostic only, must not break the session
-            _LOGGER.info("Wildcard '#' subscription attempt failed: %s", err)
+            _LOGGER.info("Wildcard subscription to %s attempt failed: %s", wildcard_topic, err)
             return
         if _subscription_refused(granted):
             _LOGGER.info(
-                "Wildcard '#' subscription refused by AWS IoT policy (SUBACK %r) — "
-                "account is scoped to its own topic, as expected for a multi-tenant "
+                "Wildcard subscription to %s refused by AWS IoT policy (SUBACK %r) — "
+                "account is scoped to its exact topic, as expected for a multi-tenant "
                 "broker",
+                wildcard_topic,
                 granted,
             )
         else:
             _LOGGER.info(
-                "Wildcard '#' subscription GRANTED (SUBACK %r) — traffic beyond the "
-                "account topic may now be visible; watch the H7152 debug log for "
-                "unfamiliar topics",
+                "Wildcard subscription to %s GRANTED (SUBACK %r) — sibling/child topics "
+                "under the account's own namespace may now be visible; watch the H7152 "
+                "debug log for unfamiliar topics",
+                wildcard_topic,
                 granted,
             )
 
