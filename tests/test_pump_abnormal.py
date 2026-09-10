@@ -32,9 +32,7 @@ def _h7152() -> GoveeDevice:
         sku="H7152",
         name="Smart Dehumidifier Max",
         device_type="devices.types.dehumidifier",
-        capabilities=(
-            GoveeCapability(type=CAPABILITY_ON_OFF, instance=INSTANCE_POWER, parameters={}),
-        ),
+        capabilities=(GoveeCapability(type=CAPABILITY_ON_OFF, instance=INSTANCE_POWER, parameters={}),),
     )
 
 
@@ -45,9 +43,7 @@ def _h7150() -> GoveeDevice:
         sku="H7150",
         name="Smart Dehumidifier",
         device_type="devices.types.dehumidifier",
-        capabilities=(
-            GoveeCapability(type=CAPABILITY_ON_OFF, instance=INSTANCE_POWER, parameters={}),
-        ),
+        capabilities=(GoveeCapability(type=CAPABILITY_ON_OFF, instance=INSTANCE_POWER, parameters={}),),
     )
 
 
