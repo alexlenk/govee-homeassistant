@@ -3283,6 +3283,10 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
             state.update_ceiling_fan_from_frames(
                 self._op_frames_from(state_data)
             )
+        if device is not None and device.supports_pump_abnormal:
+            state.update_pump_abnormal_from_frames(
+                self._op_frames_from(state_data)
+            )
         if device is not None and device.mqtt_outlet_count:
             self._apply_outlet_mask(device, state, state_data.get("onOff"))
 

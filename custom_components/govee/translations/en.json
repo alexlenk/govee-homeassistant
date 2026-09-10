@@ -311,6 +311,9 @@
       "govee_water_full": {
         "name": "Water Tank Full"
       },
+      "govee_pump_abnormal": {
+        "name": "Pump Abnormality"
+      },
       "govee_water_leak": {
         "name": "Water Leak"
       },

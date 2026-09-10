@@ -72,6 +72,11 @@ async def async_setup_entry(
             continue
         if device.supports_water_full_event:
             entities.append(GoveeWaterFullBinarySensor(coordinator, device))
+        # Pump-fault sensor for pump-model dehumidifiers (H7152 "Max") — a
+        # separate alert from water-tank-full, reached via a decoded AWS IoT
+        # status frame rather than a capability (see GoveePumpAbnormalBinarySensor).
+        if device.supports_pump_abnormal:
+            entities.append(GoveePumpAbnormalBinarySensor(coordinator, device))
         # Standalone water-leak detectors (H5054) that surface in the developer
         # device list with a bodyAppearedEvent capability — issue #62. Presence
         # sensors (H5127) share that instance but are excluded here (they get an
@@ -285,6 +290,38 @@ class GoveeOccupancyBinarySensor(GoveeEntity, BinarySensorEntity):
         """Return True when a body is present."""
         state = self.device_state
         return state.presence if state else None
+
+
+class GoveePumpAbnormalBinarySensor(GoveeEntity, BinarySensorEntity):
+    """Pump-fault sensor for pump-model dehumidifiers (H7152 "Max"), issue #114 follow-up.
+
+    Separate from :class:`GoveeWaterFullBinarySensor` — the app treats "Pump
+    Abnormality" (e.g. a clogged drain hose) and "Water Tank Full" as distinct
+    alerts, and this one is reachable through a completely different channel:
+    it has no capability entry, no OpenAPI event, and no flat MQTT ``state``
+    key (all three confirmed empty during a live fault) — only a bit in the
+    AWS IoT status push's BLE-format ``op.command`` frames, decoded in
+    :meth:`GoveeDeviceState.update_pump_abnormal_from_frames`.
+
+    Unlike ``waterFullEvent``, this is a live/level flag: it clears on its own
+    once the device reports the fault gone, so no clear-alert button/latch is
+    needed here.
+    """
+
+    _attr_device_class = BinarySensorDeviceClass.PROBLEM
+    _attr_translation_key = "govee_pump_abnormal"
+    _attr_icon = "mdi:pump"
+
+    def __init__(self, coordinator: GoveeCoordinator, device: Any) -> None:
+        """Initialize the pump-abnormal binary sensor."""
+        super().__init__(coordinator, device)
+        self._attr_unique_id = f"{device.device_id}_pump_abnormal"
+
+    @property
+    def is_on(self) -> bool | None:
+        """Return True while the pump-fault flag is set."""
+        state = self.device_state
+        return state.pump_abnormal if state else None
 
 
 class GoveeDeviceConnectivity(GoveeEntity, BinarySensorEntity):

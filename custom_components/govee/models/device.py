@@ -28,6 +28,15 @@ LEAK_HUB_SKUS = frozenset({"H5043", "H5044"})
 # SKU-locked here, consistent with LEAK_SENSOR_SKUS. Add new presence SKUs here.
 PRESENCE_SENSOR_SKUS = frozenset({"H5127"})
 
+# Pump-model dehumidifiers whose "Pump Abnormality" fault is decoded from an
+# AWS IoT status-push frame (see GoveeDeviceState.update_pump_abnormal_from_frames).
+# Not a capability the Developer API advertises, so detection is SKU-locked
+# rather than capability-based — gates the frame scan so it can't collide with
+# an unrelated device's own use of an ``aa 17`` frame. H7150/H7151 are
+# non-pump dehumidifier variants and are deliberately excluded until
+# confirmed on real hardware.
+PUMP_DEHUMIDIFIER_SKUS = frozenset({"H7152"})
+
 # Thermo-hygrometer SKUs that the Govee *Developer* API (/user/devices) does
 # NOT return, so they never reach capability-based discovery and "don't show
 # up" (issue #86). These battery WiFi sensors are present in the account-login
@@ -615,6 +624,17 @@ class GoveeDevice:
             cap.type == CAPABILITY_EVENT and cap.instance == INSTANCE_WATER_FULL_EVENT
             for cap in self.capabilities
         )
+
+    @property
+    def supports_pump_abnormal(self) -> bool:
+        """Check if device is a pump-model dehumidifier with a decoded fault frame.
+
+        SKU-locked (``PUMP_DEHUMIDIFIER_SKUS``) rather than capability-based —
+        this fault is not advertised by the Developer API at all, so there is
+        no capability to key off. See
+        ``GoveeDeviceState.update_pump_abnormal_from_frames``.
+        """
+        return self.sku.upper() in PUMP_DEHUMIDIFIER_SKUS
 
     @property
     def supports_presence_event(self) -> bool:
