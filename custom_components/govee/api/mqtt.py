@@ -213,6 +213,16 @@ GiveUpCallback = Callable[[int, str], None]
 # on_state_update at all (they return early below), so without this hook
 # any signal riding those message types would be invisible to that log.
 RawMessageCallback = Callable[[str, dict[str, Any], list[bytes]], None]
+# topic, raw decoded payload string — fired before ANY parsing/filtering,
+# including the "msg"-wrapped unwrap-or-drop branch that RawMessageCallback
+# never sees a message pass. TEMPORARY: added because RawMessageCallback
+# turned out to still be blind to one shape — a "msg"-wrapped payload
+# lacking a top-level "device"+"state" pair (e.g. a command/read-response
+# envelope) is silently dropped by _handle_message's own unwrap logic
+# before RawMessageCallback's call site is ever reached. AnyMessageCallback
+# runs ahead of that drop so nothing riding an unrecognised envelope shape
+# is invisible to the H7152 debug log.
+AnyMessageCallback = Callable[[str, str], None]
 """Invoked when the reconnect loop exhausts MAX_RECONNECT_ATTEMPTS.
 Args: (attempts_made, last_error_message)."""
 
@@ -336,6 +346,7 @@ class GoveeAwsIotClient:
         on_connected: Callable[[], None] | None = None,
         on_disconnected: Callable[[], None] | None = None,
         on_raw_message: RawMessageCallback | None = None,
+        on_any_message: AnyMessageCallback | None = None,
     ) -> None:
         """Initialize the AWS IoT MQTT client.
 
@@ -348,6 +359,9 @@ class GoveeAwsIotClient:
             on_raw_message: Optional callback(device_id, data, frames) fired
                 for every inbound message regardless of cmd — see
                 RawMessageCallback's docstring.
+            on_any_message: Optional callback(topic, payload_str) fired for
+                every inbound message before any parsing/filtering at all —
+                see AnyMessageCallback's docstring.
             on_connected: Optional callback fired after every successful
                 CONNACK + SUBACK, so the caller can clear that repair issue.
             on_disconnected: Optional callback fired when a live session
@@ -360,6 +374,7 @@ class GoveeAwsIotClient:
         self._on_connected = on_connected
         self._on_disconnected = on_disconnected
         self._on_raw_message = on_raw_message
+        self._on_any_message = on_any_message
         self._running = False
         self._connected = False
         self._task: asyncio.Task[None] | None = None
@@ -788,6 +803,17 @@ class GoveeAwsIotClient:
                 if isinstance(raw_payload, bytes)
                 else str(raw_payload)
             )
+
+            # Fires before ANY parsing/filtering below — including the
+            # "msg"-wrapped unwrap-or-drop branch a few lines down, which can
+            # silently `return` on an envelope shape on_raw_message never
+            # sees. Never let a debug hook break real message handling.
+            topic_str = str(getattr(message, "topic", ""))
+            if self._on_any_message is not None:
+                try:
+                    self._on_any_message(topic_str, payload_str)
+                except Exception as err:  # noqa: BLE001 — debug hook, must not break MQTT
+                    _LOGGER.debug("on_any_message callback failed: %s", err)
 
             # Log every inbound account-topic message before any filtering so a
             # debug capture shows exactly what arrives — used to determine

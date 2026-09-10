@@ -425,3 +425,103 @@ class TestH7152RawMessageCapture:
         assert lines[0]["sta"] == {"stc": "19_0_38_43170_1"}
         assert lines[0]["op_frames_hex"] == [FRAME_UNRELATED.hex(), FRAME_PUMP_ABNORMAL.hex()]
         assert lines[0]["state"] == {"result": 1}
+
+
+class TestH7152AnyMessageCapture:
+    """TEMPORARY: _on_mqtt_any_message catches every inbound message verbatim,
+    before any parsing/filtering — including a "msg"-wrapped payload that
+    _handle_message's own unwrap-or-drop logic discards before
+    on_raw_message's call site is ever reached (confirmed live: the one
+    ptReal sample seen while the Govee app was open was exactly such a
+    dropped shape). See _on_mqtt_any_message's docstring.
+    """
+
+    def _coord(self, tmp_path, *, register_h7152=True):
+        import asyncio
+
+        import custom_components.govee.coordinator as coord_mod
+
+        hass = MagicMock()
+        log_path = tmp_path / "govee_h7152_debug.jsonl"
+        hass.config.path.return_value = str(log_path)
+
+        async def _run_in_executor(fn, *args):
+            return fn(*args)
+
+        hass.async_add_executor_job = AsyncMock(side_effect=_run_in_executor)
+
+        scheduled: list[asyncio.Task] = []
+
+        def _create_background_task(_hass, coro, name=None):
+            task = asyncio.ensure_future(coro)
+            scheduled.append(task)
+            return task
+
+        config_entry = MagicMock()
+        config_entry.entry_id = "test_entry"
+        config_entry.async_create_background_task = MagicMock(side_effect=_create_background_task)
+        coord = coord_mod.GoveeCoordinator(
+            hass=hass,
+            config_entry=config_entry,
+            api_client=MagicMock(),
+            iot_credentials=None,
+            poll_interval=60,
+        )
+        if register_h7152:
+            coord._devices[DEVICE_ID] = _h7152()
+        return coord, log_path, scheduled
+
+    @staticmethod
+    def _lines(log_path):
+        if not log_path.exists():
+            return []
+        return [json.loads(line) for line in log_path.read_text().splitlines()]
+
+    def test_payload_without_h7152_id_is_skipped(self, tmp_path):
+        coord, _log_path, scheduled = self._coord(tmp_path)
+        coord._on_mqtt_any_message("GD/some/topic", '{"device": "AA:BB:CC:DD:EE:FF:00:11", "cmd": "ptReal"}')
+        assert scheduled == []
+
+    def test_no_h7152_registered_is_skipped(self, tmp_path):
+        coord, _log_path, scheduled = self._coord(tmp_path, register_h7152=False)
+        payload = f'{{"device": "{DEVICE_ID}", "cmd": "ptReal"}}'
+        coord._on_mqtt_any_message("GD/some/topic", payload)
+        assert scheduled == []
+
+    def test_non_pump_sku_is_skipped(self, tmp_path):
+        coord, _log_path, scheduled = self._coord(tmp_path, register_h7152=False)
+        coord._devices[DEVICE_ID] = _h7150()
+        payload = f'{{"device": "{DEVICE_ID}", "cmd": "ptReal"}}'
+        coord._on_mqtt_any_message("GD/some/topic", payload)
+        assert scheduled == []
+
+    @pytest.mark.asyncio
+    async def test_h7152_payload_is_scheduled_and_logged_verbatim(self, tmp_path):
+        coord, log_path, scheduled = self._coord(tmp_path)
+        # A "msg"-wrapped ack lacking a top-level "state" key — exactly the
+        # shape _handle_message's unwrap logic drops before on_raw_message
+        # ever fires. on_any_message must still catch it.
+        payload = (
+            '{"msg": {"cmd": "ptReal", "data": {"command": [], "device": "'
+            + DEVICE_ID
+            + '", "sku": "H7152"}, "cmdVersion": 0, "transaction": "v_123", "type": 1}}'
+        )
+        coord._on_mqtt_any_message("GD/topic/here", payload)
+        assert len(scheduled) == 1
+        await scheduled[0]
+
+        lines = self._lines(log_path)
+        assert len(lines) == 1
+        assert lines[0]["source"] == "mqtt_any"
+        assert lines[0]["topic"] == "GD/topic/here"
+        assert lines[0]["payload"] == payload
+
+    @pytest.mark.asyncio
+    async def test_oversized_payload_is_truncated(self, tmp_path):
+        coord, log_path, scheduled = self._coord(tmp_path)
+        payload = f'{{"device": "{DEVICE_ID}", "filler": "' + ("x" * 9000) + '"}'
+        coord._on_mqtt_any_message("GD/topic", payload)
+        await scheduled[0]
+
+        lines = self._lines(log_path)
+        assert len(lines[0]["payload"]) == 8192

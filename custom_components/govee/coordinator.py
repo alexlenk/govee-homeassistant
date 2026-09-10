@@ -1678,6 +1678,7 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
             on_connected=self._on_mqtt_connected,
             on_disconnected=self._on_mqtt_disconnected,
             on_raw_message=self._on_mqtt_raw_message,
+            on_any_message=self._on_mqtt_any_message,
         )
 
         if self._mqtt_client.available:
@@ -3284,6 +3285,48 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
                 "result": data.get("result"),
                 "op_frames_hex": [f.hex() for f in frames],
                 "state": data.get("state"),
+            }
+        )
+
+    @callback
+    def _on_mqtt_any_message(self, topic: str, payload_str: str) -> None:
+        """TEMPORARY: catch every inbound MQTT message for an H7152, verbatim,
+        before ANY parsing or filtering.
+
+        `_on_mqtt_raw_message` still misses one shape: a "msg"-wrapped
+        payload lacking a top-level "device"+"state" pair (e.g. a
+        command-accepted ack, or a read-response using a different envelope)
+        is dropped by `_handle_message`'s own unwrap logic before
+        `on_raw_message`'s call site is ever reached — confirmed live: the
+        one `ptReal` sample captured while the Govee app had the H7152's
+        live-readings screen open was itself just such an ack, and *only*
+        that shape has been seen from this channel so far. This hook runs
+        ahead of that drop, so nothing is invisible regardless of shape. A
+        cheap substring match on the known H7152 device ID (no JSON parsing
+        — the whole point is not assuming any structure) keeps this from
+        logging every OTHER device's traffic on the shared account topic.
+        """
+        h7152_ids = [device_id for device_id, device in self._devices.items() if device.supports_pump_abnormal]
+        if not any(device_id in payload_str for device_id in h7152_ids):
+            return
+        self._config_entry.async_create_background_task(
+            self.hass,
+            self._log_h7152_debug_raw_payload(topic, payload_str),
+            name="govee_h7152_debug_log_any",
+        )
+
+    async def _log_h7152_debug_raw_payload(self, topic: str, payload_str: str) -> None:
+        """TEMPORARY: sibling of _log_h7152_debug_raw_message that logs the
+        untouched wire payload — see _on_mqtt_any_message. Capped well above
+        any observed H7152 message size so nothing is truncated in practice,
+        while still bounding one stray oversized payload.
+        """
+        await self._append_h7152_debug_line(
+            {
+                "source": "mqtt_any",
+                "ts": dt_util.utcnow().isoformat(),
+                "topic": topic,
+                "payload": payload_str[:8192],
             }
         )
 
