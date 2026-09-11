@@ -20,8 +20,14 @@ from custom_components.govee.api.mqtt import GoveeAwsIotClient, _subscription_re
 
 def _creds(**over) -> GoveeIotCredentials:
     base = dict(
-        token="t", refresh_token="r", account_topic="GA/account", iot_cert="cert",
-        iot_key="key", iot_ca=None, client_id="cid", endpoint="endpoint",
+        token="t",
+        refresh_token="r",
+        account_topic="GA/account",
+        iot_cert="cert",
+        iot_key="key",
+        iot_ca=None,
+        client_id="cid",
+        endpoint="endpoint",
     )
     base.update(over)
     return GoveeIotCredentials(**base)
@@ -54,7 +60,11 @@ class FakeAiomqtt:
         self.clients = []
 
     def Client(self, **kwargs):  # noqa: N802 - mimics aiomqtt.Client
-        spec = self.sessions.pop(0) if self.sessions else {"drop_error": self.MqttError("no more sessions")}
+        spec = (
+            self.sessions.pop(0)
+            if self.sessions
+            else {"drop_error": self.MqttError("no more sessions")}
+        )
         client = MagicMock()
         client.kwargs = kwargs
         connect_error = spec.get("connect_error")
@@ -67,7 +77,9 @@ class FakeAiomqtt:
         client.__aenter__ = AsyncMock(side_effect=aenter)
         client.__aexit__ = AsyncMock(return_value=False)
         client.subscribe = AsyncMock(return_value=spec.get("granted", (1,)))
-        client.messages = FakeMessages(spec.get("drop_error", self.MqttError("dropped")))
+        client.messages = FakeMessages(
+            spec.get("drop_error", self.MqttError("dropped"))
+        )
         client.publish = AsyncMock()
         self.clients.append(client)
         return client
@@ -81,7 +93,9 @@ def run_loop(monkeypatch):
         fake = FakeAiomqtt(sessions)
         monkeypatch.setattr(mqtt_mod, "aiomqtt", fake)
         monkeypatch.setattr(mqtt_mod, "AIOMQTT_AVAILABLE", True)
-        client = GoveeAwsIotClient(_creds(), on_state_update=MagicMock(), **client_kwargs)
+        client = GoveeAwsIotClient(
+            _creds(), on_state_update=MagicMock(), **client_kwargs
+        )
         client._create_ssl_context_sync = MagicMock(return_value=MagicMock())
         sleeps: list[float] = []
         if clock is not None:
@@ -107,7 +121,9 @@ class TestReconnectPolicy:
         monkeypatch.setattr(mqtt_mod, "MAX_RECONNECT_ATTEMPTS", 3)
         give_up = MagicMock()
         sessions = [{"connect_error": OSError("unreachable")}] * 6
-        client, fake, sleeps = await run_loop(sessions, stop_after_sleeps=6, on_give_up=give_up)
+        client, fake, sleeps = await run_loop(
+            sessions, stop_after_sleeps=6, on_give_up=give_up
+        )
 
         assert len(fake.clients) == 6  # kept trying past the threshold
         give_up.assert_called_once()
@@ -126,8 +142,12 @@ class TestReconnectPolicy:
     async def test_flap_counts_as_failure_and_backs_off(self, run_loop):
         """Connect-then-immediate-drop (client-id takeover) must not reset backoff."""
         now = [1000.0]
-        sessions = [{"granted": (1,), "drop_error": FakeAiomqtt.MqttError("kicked")}] * 4
-        client, _, sleeps = await run_loop(sessions, stop_after_sleeps=4, clock=lambda: now[0])
+        sessions = [
+            {"granted": (1,), "drop_error": FakeAiomqtt.MqttError("kicked")}
+        ] * 4
+        client, _, sleeps = await run_loop(
+            sessions, stop_after_sleeps=4, clock=lambda: now[0]
+        )
         assert sleeps == [5, 10, 20, 40]
         assert client.consecutive_failures == 4
 
@@ -136,7 +156,9 @@ class TestReconnectPolicy:
         now = [1000.0]
 
         def clock():
-            now[0] += mqtt_mod.STABLE_SESSION_SECONDS  # every read advances a full minute
+            now[
+                0
+            ] += mqtt_mod.STABLE_SESSION_SECONDS  # every read advances a full minute
             return now[0]
 
         sessions = [
@@ -154,13 +176,17 @@ class TestReconnectPolicy:
     async def test_connected_callback_fires_after_suback(self, run_loop):
         connected = MagicMock()
         sessions = [{"granted": (1,), "drop_error": FakeAiomqtt.MqttError("bye")}]
-        client, fake, _ = await run_loop(sessions, stop_after_sleeps=1, on_connected=connected)
+        client, fake, _ = await run_loop(
+            sessions, stop_after_sleeps=1, on_connected=connected
+        )
         connected.assert_called_once()
         fake.clients[0].subscribe.assert_awaited_once_with("GA/account", qos=1)
         assert client.last_error is not None and "bye" in client.last_error
 
     @pytest.mark.asyncio
-    async def test_disconnected_callback_fires_only_after_a_live_session(self, run_loop):
+    async def test_disconnected_callback_fires_only_after_a_live_session(
+        self, run_loop
+    ):
         disconnected = MagicMock()
         sessions = [
             {"connect_error": OSError("x")},  # never connected: no callback
@@ -174,7 +200,9 @@ class TestReconnectPolicy:
         """SUBACK 0x80 must not leave the client 'connected' and deaf."""
         connected = MagicMock()
         sessions = [{"granted": (128,)}, {"granted": (0x80,)}]
-        client, _, sleeps = await run_loop(sessions, stop_after_sleeps=2, on_connected=connected)
+        client, _, sleeps = await run_loop(
+            sessions, stop_after_sleeps=2, on_connected=connected
+        )
         connected.assert_not_called()
         assert client.connected is False
         assert client.consecutive_failures == 2
@@ -193,18 +221,24 @@ class TestReconnectPolicy:
         fake.clients[0].subscribe.assert_awaited_once_with("GA/account", qos=1)
 
     @pytest.mark.asyncio
-    async def test_wildcard_subscribe_attempted_after_account_topic_when_enabled(self, run_loop):
+    async def test_wildcard_subscribe_attempted_after_account_topic_when_enabled(
+        self, run_loop
+    ):
         from unittest.mock import call
 
         sessions = [{"granted": (1,), "drop_error": FakeAiomqtt.MqttError("bye")}]
-        _client, fake, _ = await run_loop(sessions, stop_after_sleeps=1, attempt_wildcard_subscribe=True)
+        _client, fake, _ = await run_loop(
+            sessions, stop_after_sleeps=1, attempt_wildcard_subscribe=True
+        )
         assert fake.clients[0].subscribe.await_args_list == [
             call("GA/account", qos=1),
             call("GA/account/#", qos=0),
         ]
 
     @pytest.mark.asyncio
-    async def test_refused_wildcard_subscribe_does_not_affect_connected_callback(self, run_loop):
+    async def test_refused_wildcard_subscribe_does_not_affect_connected_callback(
+        self, run_loop
+    ):
         """A wildcard SUBACK 0x80 is the expected, informative outcome — the
         primary session (already confirmed healthy before this runs) must
         stay up and on_connected must still fire.
@@ -212,7 +246,10 @@ class TestReconnectPolicy:
         connected = MagicMock()
         sessions = [{"granted": (1,), "drop_error": FakeAiomqtt.MqttError("bye")}]
         client, fake, _ = await run_loop(
-            sessions, stop_after_sleeps=1, on_connected=connected, attempt_wildcard_subscribe=True
+            sessions,
+            stop_after_sleeps=1,
+            on_connected=connected,
+            attempt_wildcard_subscribe=True,
         )
         # Both calls share the fixture's single subscribe mock, so both
         # return the scripted "granted" value (1,) — not a refusal, but this
@@ -246,7 +283,9 @@ class TestPublish:
         client._client = MagicMock()
         client._client.publish = AsyncMock()
 
-        assert await client.async_publish_command("GD/topic", "turn", {"val": 1}) is True
+        assert (
+            await client.async_publish_command("GD/topic", "turn", {"val": 1}) is True
+        )
 
         args, kwargs = client._client.publish.call_args
         assert args[0] == "GD/topic"
@@ -260,7 +299,71 @@ class TestPublish:
         client._client = MagicMock()
         client._client.publish = AsyncMock(side_effect=asyncio.TimeoutError())
 
-        assert await client.async_publish_command("GD/topic", "turn", {"val": 1}) is False
+        assert (
+            await client.async_publish_command("GD/topic", "turn", {"val": 1}) is False
+        )
+
+
+class TestPublishStatusQuery:
+    """The periodic per-device status re-query (mirrors the Govee app's own
+    Cmd4Status / Iot.A() request) — distinct envelope from async_publish_command:
+    type 0, no data key.
+    """
+
+    @pytest.mark.asyncio
+    async def test_builds_type_0_query_with_no_data_key(self):
+        client = GoveeAwsIotClient(_creds(), on_state_update=MagicMock())
+        client._connected = True
+        client._client = MagicMock()
+        client._client.publish = AsyncMock()
+
+        assert await client.async_publish_status_query("GD/topic") is True
+
+        args, kwargs = client._client.publish.call_args
+        assert args[0] == "GD/topic"
+        msg = json.loads(args[1])["msg"]
+        assert msg["cmd"] == "status"
+        assert msg["type"] == 0
+        assert msg["cmdVersion"] == 2
+        assert "data" not in msg
+        assert kwargs == {"qos": 1, "timeout": mqtt_mod.ACK_TIMEOUT}
+
+    @pytest.mark.asyncio
+    async def test_cmd_version_override(self):
+        client = GoveeAwsIotClient(_creds(), on_state_update=MagicMock())
+        client._connected = True
+        client._client = MagicMock()
+        client._client.publish = AsyncMock()
+
+        await client.async_publish_status_query("GD/topic", cmd_version=0)
+
+        args, _ = client._client.publish.call_args
+        assert json.loads(args[1])["msg"]["cmdVersion"] == 0
+
+    @pytest.mark.asyncio
+    async def test_not_connected_returns_false(self):
+        client = GoveeAwsIotClient(_creds(), on_state_update=MagicMock())
+        client._connected = False
+
+        assert await client.async_publish_status_query("GD/topic") is False
+
+    @pytest.mark.asyncio
+    async def test_no_topic_returns_false(self):
+        client = GoveeAwsIotClient(_creds(), on_state_update=MagicMock())
+        client._connected = True
+        client._client = MagicMock()
+
+        assert await client.async_publish_status_query(None) is False
+        assert await client.async_publish_status_query("") is False
+
+    @pytest.mark.asyncio
+    async def test_publish_failure_returns_false(self):
+        client = GoveeAwsIotClient(_creds(), on_state_update=MagicMock())
+        client._connected = True
+        client._client = MagicMock()
+        client._client.publish = AsyncMock(side_effect=asyncio.TimeoutError())
+
+        assert await client.async_publish_status_query("GD/topic") is False
 
 
 class TestRestart:
@@ -323,7 +426,9 @@ class TestMsgWrappedPushes:
         client = GoveeAwsIotClient(_creds(), on_state_update=callback)
         message = MagicMock()
         message.topic = "GA/account"
-        message.payload = json.dumps({"msg": {"cmd": "turn", "data": {"val": 1}}}).encode()
+        message.payload = json.dumps(
+            {"msg": {"cmd": "turn", "data": {"val": 1}}}
+        ).encode()
 
         await client._handle_message(message)
 

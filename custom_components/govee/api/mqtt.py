@@ -139,10 +139,7 @@ rqXRfboQnoZsG4q5WTP468SQvvG5
 # the -ats endpoints serve an RSA chain (Root CA 1) today, but the ECC chains
 # (Root CA 3/4) and Root CA 2 are equally valid and a pin on one root would
 # fail verification the day AWS rotates. Source: https://www.amazontrust.com/repository/
-AMAZON_ROOT_CAS = (
-    AMAZON_ROOT_CA1
-    + "\n"
-    + """-----BEGIN CERTIFICATE-----
+AMAZON_ROOT_CAS = AMAZON_ROOT_CA1 + "\n" + """-----BEGIN CERTIFICATE-----
 MIIFQTCCAymgAwIBAgITBmyf0pY1hp8KD+WGePhbJruKNzANBgkqhkiG9w0BAQwF
 ADA5MQswCQYDVQQGEwJVUzEPMA0GA1UEChMGQW1hem9uMRkwFwYDVQQDExBBbWF6
 b24gUm9vdCBDQSAyMB4XDTE1MDUyNjAwMDAwMFoXDTQwMDUyNjAwMDAwMFowOTEL
@@ -199,7 +196,6 @@ CkcO8DdZEv8tmZQoTipPNU0zWgIxAOp1AE47xDqUEpHJWEadIRNyp4iciuRMStuW
 1KyLa2tJElMzrdfkviT8tQp21KW8EA==
 -----END CERTIFICATE-----
 """
-)
 
 
 # Type for state update callback
@@ -261,9 +257,8 @@ def _decode_thermo_frame(raw: bytes) -> dict[str, Any] | None:
 
     return {
         "sensor_slot": raw[2],
-        "temperature_c": (
-            temp_byte + (temp_carry << 8) + THERMO_TEMP_OFFSET
-        ) / THERMO_TEMP_SCALE,
+        "temperature_c": (temp_byte + (temp_carry << 8) + THERMO_TEMP_OFFSET)
+        / THERMO_TEMP_SCALE,
         "battery": battery,
         "frame_ts": frame_ts,
     }
@@ -650,8 +645,12 @@ class GoveeAwsIotClient:
         wildcard_topic = f"{self._credentials.account_topic}/#"
         try:
             granted = await client.subscribe(wildcard_topic, qos=0)
-        except Exception as err:  # noqa: BLE001 — diagnostic only, must not break the session
-            _LOGGER.info("Wildcard subscription to %s attempt failed: %s", wildcard_topic, err)
+        except (
+            Exception
+        ) as err:  # noqa: BLE001 — diagnostic only, must not break the session
+            _LOGGER.info(
+                "Wildcard subscription to %s attempt failed: %s", wildcard_topic, err
+            )
             return
         if _subscription_refused(granted):
             _LOGGER.info(
@@ -746,7 +745,8 @@ class GoveeAwsIotClient:
                             break  # type: ignore[unreachable]
                         if (
                             self._consecutive_failures
-                            and time.monotonic() - session_started >= STABLE_SESSION_SECONDS
+                            and time.monotonic() - session_started
+                            >= STABLE_SESSION_SECONDS
                         ):
                             self._consecutive_failures = 0
                             self._unhealthy_reported = False
@@ -791,7 +791,11 @@ class GoveeAwsIotClient:
                     # First failure is worth a WARNING; the rest of a streak is
                     # noise at that level (HA core logs retries at DEBUG).
                     _LOGGER.log(
-                        logging.WARNING if self._consecutive_failures == 1 else logging.DEBUG,
+                        (
+                            logging.WARNING
+                            if self._consecutive_failures == 1
+                            else logging.DEBUG
+                        ),
                         "AWS IoT connection %s (%s); reconnecting in %ds (attempt %d)",
                         "dropped early" if session_started is not None else "failed",
                         self._last_error,
@@ -887,7 +891,9 @@ class GoveeAwsIotClient:
             if self._on_any_message is not None:
                 try:
                     self._on_any_message(topic_str, payload_str)
-                except Exception as err:  # noqa: BLE001 — debug hook, must not break MQTT
+                except (
+                    Exception
+                ) as err:  # noqa: BLE001 — debug hook, must not break MQTT
                     _LOGGER.debug("on_any_message callback failed: %s", err)
 
             # Log every inbound account-topic message before any filtering so a
@@ -917,7 +923,11 @@ class GoveeAwsIotClient:
                         wrapped = json.loads(wrapped)
                     except json.JSONDecodeError:
                         wrapped = None
-                if isinstance(wrapped, dict) and "device" in wrapped and "state" in wrapped:
+                if (
+                    isinstance(wrapped, dict)
+                    and "device" in wrapped
+                    and "state" in wrapped
+                ):
                     data = wrapped
                 else:
                     _LOGGER.debug("Ignoring command/response message")
@@ -966,7 +976,9 @@ class GoveeAwsIotClient:
             if self._on_raw_message is not None:
                 try:
                     self._on_raw_message(device_id, data, frames)
-                except Exception as err:  # noqa: BLE001 — debug hook, must not break MQTT
+                except (
+                    Exception
+                ) as err:  # noqa: BLE001 — debug hook, must not break MQTT
                     _LOGGER.debug("on_raw_message callback failed: %s", err)
 
             cmd = data.get("cmd")
@@ -1099,9 +1111,7 @@ class GoveeAwsIotClient:
                     }
 
         if not probes:
-            _LOGGER.debug(
-                "Unhandled probe frame from %s: %s", device_id, raw[:2].hex()
-            )
+            _LOGGER.debug("Unhandled probe frame from %s: %s", device_id, raw[:2].hex())
             return
 
         try:
@@ -1333,6 +1343,69 @@ class GoveeAwsIotClient:
             return True
         except Exception as err:
             _LOGGER.error("Failed to publish %s: %s", cmd, err)
+            return False
+
+    async def async_publish_status_query(
+        self,
+        device_topic: str | None,
+        *,
+        cmd_version: int = 2,
+    ) -> bool:
+        """Publish a status query to a device's own MQTT topic.
+
+        Mirrors the Govee Android app's own status request (``Cmd4Status`` /
+        ``Iot.A()``), which the app's device-list screen sends to every device
+        roughly every 30-60s while it is on screen. Reverse-engineering found
+        that devices are not reliably autonomous pushers — most account-topic
+        "status" traffic is a *reply* to this exact query, from whoever last
+        asked. Calling this periodically is what keeps state fresh without the
+        Govee app open; see docs/govee-protocol-reference.md, §9.5 (H7150/H7152
+        entry) for how this was found.
+
+        Deliberately not built on ``async_publish_command``: a status query
+        uses ``type: 0`` (query) with no ``data`` key, while that method
+        hardcodes ``type: 1`` (control) and always includes one — reusing it
+        here would publish a malformed request.
+
+        Args:
+            device_topic: Device-specific MQTT topic to query. Required for
+                          AWS IoT - obtained from undocumented API.
+            cmd_version: Command version. 2 matches the app's own default for
+                         status requests (see the Command Envelope Details
+                         table in docs/govee-protocol-reference.md, §4.6).
+
+        Returns:
+            True if publish succeeded, False otherwise.
+        """
+        if not self._connected or self._client is None:
+            _LOGGER.debug("Cannot publish status query: MQTT not connected")
+            return False
+
+        if not device_topic:
+            _LOGGER.debug("Cannot publish status query: No device topic available")
+            return False
+
+        payload = {
+            "msg": {
+                "cmd": "status",
+                "cmdVersion": cmd_version,
+                "transaction": f"v_{int(time.time() * 1000)}",
+                "type": 0,
+            }
+        }
+
+        try:
+            await self._client.publish(
+                device_topic, json.dumps(payload), qos=1, timeout=ACK_TIMEOUT
+            )
+            _LOGGER.debug("Published status query to %s...", device_topic[:30])
+            return True
+        except Exception as err:
+            _LOGGER.debug(
+                "Failed to publish status query to %s...: %s",
+                device_topic[:30],
+                err,
+            )
             return False
 
     async def async_publish_ptreal(

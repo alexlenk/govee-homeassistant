@@ -75,11 +75,13 @@ from .const import (
     CONF_EMAIL,
     CONF_ENABLE_MQTT_CONTROL,
     CONF_LAN_TARGETS,
+    CONF_MQTT_STATUS_INTERVAL,
     CONF_PASSWORD,
     CONF_PROBE_POLL_INTERVAL,
     CONF_WATER_DETECTOR_POLL_INTERVAL,
     DEFAULT_API_TEMPERATURE_UNIT,
     DEFAULT_ENABLE_MQTT_CONTROL,
+    DEFAULT_MQTT_STATUS_INTERVAL,
     DEFAULT_PROBE_POLL_INTERVAL,
     DEFAULT_WATER_DETECTOR_POLL_INTERVAL,
     DEVICE_REDISCOVERY_INTERVAL,
@@ -93,8 +95,10 @@ from .const import (
     LAN_WRITE_CONFIRM_TIMEOUT,
     LAN_WRITE_SUPPRESS_SECONDS,
     LAN_WRITE_SUPPRESS_THRESHOLD,
+    MAX_MQTT_STATUS_INTERVAL,
     MAX_PROBE_POLL_INTERVAL,
     MAX_WATER_DETECTOR_POLL_INTERVAL,
+    MIN_MQTT_STATUS_INTERVAL,
     MIN_PROBE_POLL_INTERVAL,
     MIN_WATER_DETECTOR_POLL_INTERVAL,
     OPTIMISTIC_GRACE_CAP_SECONDS,
@@ -452,6 +456,10 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
         self._bff_poll_task: asyncio.Task[None] | None = None
         # Standalone water-detector (H5054) leak polling (issue #62).
         self._wd_poll_unsub: CALLBACK_TYPE | None = None
+        # Periodic per-device MQTT status re-query (see async_publish_status_query
+        # docstring) — devices don't reliably push spontaneously; this is what the
+        # Govee app itself does while its device list is on screen.
+        self._status_poll_unsub: CALLBACK_TYPE | None = None
         # Probe thermometers (H5192) are pull devices: nothing arrives
         # unless we ask. The timer only runs while at least one device has
         # its live-polling switch on, so an idle thermometer is left alone.
@@ -1063,6 +1071,20 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
             await self._run_startup_step(
                 self._fetch_device_topics(), "fetch device topics"
             )
+            # Devices are largely poll-triggered responders on their own MQTT
+            # topic, not autonomous pushers (see async_publish_status_query) —
+            # without this, state could go stale as soon as the Govee app was
+            # closed. Fires once immediately, same as the water-detector poll
+            # above: a reload also restarts this timer, and making the user
+            # wait a full interval after every reload for state that a reload
+            # is often specifically trying to refresh would be a worse
+            # trade-off than the extra request burst. Bounded so a slow/failed
+            # publish degrades to "wait for the first tick" instead of hanging
+            # setup.
+            await self._run_startup_step(
+                self._poll_mqtt_status(), "poll MQTT device status"
+            )
+            self._schedule_status_poll()
 
         # OpenAPI event subscription — needs only the API key (no account
         # login), so it runs regardless of IoT credentials. Failure-isolated:
@@ -1860,11 +1882,15 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
         state = self._get_or_create_state(device_id)
         state.water_full = False
         self._water_full_changed_at[device_id] = dt_util.utcnow()
-        _LOGGER.info("Water-tank-full alert cleared for %s (user action, #118)", device_id)
+        _LOGGER.info(
+            "Water-tank-full alert cleared for %s (user action, #118)", device_id
+        )
         self.async_set_updated_data(self._states)
 
     @callback
-    def restore_water_full(self, device_id: str, is_full: bool, changed_at: datetime | None) -> None:
+    def restore_water_full(
+        self, device_id: str, is_full: bool, changed_at: datetime | None
+    ) -> None:
         """Restore the water-tank-full latch across HA restarts (#118).
 
         Applied only when the live value is still None — a live event that
@@ -2269,9 +2295,7 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
                 len(newly_battery_capable),
                 ", ".join(sorted(newly_battery_capable)),
             )
-            self.hass.config_entries.async_schedule_reload(
-                self._config_entry.entry_id
-            )
+            self.hass.config_entries.async_schedule_reload(self._config_entry.entry_id)
 
             # NOTE: the BFF ``deviceSettings.waterFull`` field is deliberately
             # NOT applied here anymore. It is the app's "Full Bucket Alert"
@@ -2408,12 +2432,10 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
                     continue
 
                 if sensor["sku"] in PROBE_THERMOMETER_BFF_SKUS:
-                    self._devices[device_id] = (
-                        GoveeDevice.synthetic_probe_thermometer(
-                            device_id=device_id,
-                            sku=sensor["sku"],
-                            name=sensor["name"],
-                        )
+                    self._devices[device_id] = GoveeDevice.synthetic_probe_thermometer(
+                        device_id=device_id,
+                        sku=sensor["sku"],
+                        name=sensor["name"],
                     )
                     # Membership here buys three things at once: the
                     # Developer poll skips the device (it 404s on this SKU),
@@ -2935,6 +2957,73 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
         if changed:
             self.async_update_listeners()
 
+    @property
+    def _mqtt_status_poll_interval(self) -> int:
+        """Configured MQTT status-poll interval (seconds), clamped to bounds.
+
+        Read per tick so the value is picked up on the reload that follows an
+        options change. Out-of-range or non-numeric values (e.g. hand-edited
+        options) fall back to the default rather than arming a bad timer.
+        """
+        raw = self._config_entry.options.get(
+            CONF_MQTT_STATUS_INTERVAL, DEFAULT_MQTT_STATUS_INTERVAL
+        )
+        try:
+            interval = int(raw)
+        except (TypeError, ValueError):
+            return DEFAULT_MQTT_STATUS_INTERVAL
+        if not (MIN_MQTT_STATUS_INTERVAL <= interval <= MAX_MQTT_STATUS_INTERVAL):
+            return DEFAULT_MQTT_STATUS_INTERVAL
+        return interval
+
+    @property
+    def _mqtt_status_poll_targets(self) -> list[str]:
+        """Device IDs eligible for the periodic MQTT status re-query.
+
+        Any device with a known device-specific MQTT topic — anything the
+        coordinator could also publish a command to. Groups have no topic of
+        their own and are excluded.
+        """
+        return [
+            device_id
+            for device_id, device in self._devices.items()
+            if not device.is_group and device_id in self._device_topics
+        ]
+
+    def _schedule_status_poll(self) -> None:
+        """Schedule the next MQTT status re-query, replacing any pending timer."""
+        if self._status_poll_unsub:
+            self._status_poll_unsub()
+        self._status_poll_unsub = async_call_later(
+            self.hass, self._mqtt_status_poll_interval, self._status_poll_callback
+        )
+
+    async def _status_poll_callback(self, _now: Any = None) -> None:
+        """Periodic callback: re-query every eligible device, then re-arm."""
+        await self._poll_mqtt_status()
+        self._schedule_status_poll()
+
+    async def _poll_mqtt_status(self) -> None:
+        """Publish a status query to every device's own MQTT topic.
+
+        See ``GoveeAwsIotClient.async_publish_status_query`` for why this
+        exists — without it, devices that don't autonomously push (most of
+        them, per the Android app reverse-engineering) go stale the moment
+        nobody has asked in a while. Queries go out sequentially, one device
+        at a time, rather than in parallel: the interval already trades update
+        latency for request volume, so there is no reason to burst all of them
+        at once.
+        """
+        client = self._mqtt_client
+        if client is None or not client.connected:
+            return
+
+        for device_id in self._mqtt_status_poll_targets:
+            topic = self._device_topics.get(device_id)
+            if not topic:
+                continue
+            await client.async_publish_status_query(topic)
+
     @callback
     def _handle_leak_event(self, state_data: dict[str, Any]) -> None:
         """Handle a decoded leak event from MQTT multiSync message."""
@@ -3261,7 +3350,9 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
         self._schedule_bff_leak_poll()
 
     @callback
-    def _on_mqtt_raw_message(self, device_id: str, data: dict[str, Any], frames: list[bytes]) -> None:
+    def _on_mqtt_raw_message(
+        self, device_id: str, data: dict[str, Any], frames: list[bytes]
+    ) -> None:
         """TEMPORARY: fan-out for EVERY inbound MQTT message, not just "status".
 
         _on_mqtt_state_update (via _log_h7152_debug_frame) already logs
@@ -3283,7 +3374,9 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
             name="govee_h7152_debug_log_raw",
         )
 
-    async def _log_h7152_debug_raw_message(self, data: dict[str, Any], frames: list[bytes]) -> None:
+    async def _log_h7152_debug_raw_message(
+        self, data: dict[str, Any], frames: list[bytes]
+    ) -> None:
         """TEMPORARY: sibling of _log_h7152_debug_frame for non-status pushes
         (multiSync, ptReal, anything else) — see _on_mqtt_raw_message.
         """
@@ -3319,7 +3412,11 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
         — the whole point is not assuming any structure) keeps this from
         logging every OTHER device's traffic on the shared account topic.
         """
-        h7152_ids = [device_id for device_id, device in self._devices.items() if device.supports_pump_abnormal]
+        h7152_ids = [
+            device_id
+            for device_id, device in self._devices.items()
+            if device.supports_pump_abnormal
+        ]
         if not any(device_id in payload_str for device_id in h7152_ids):
             return
         self._config_entry.async_create_background_task(
@@ -3396,9 +3493,7 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
         # Update state from MQTT data (also flips online back True — issue #68)
         state.update_from_mqtt(state_data, ceiling_fan=ceiling_fan)
         if ceiling_fan:
-            state.update_ceiling_fan_from_frames(
-                self._op_frames_from(state_data)
-            )
+            state.update_ceiling_fan_from_frames(self._op_frames_from(state_data))
         if device is not None and device.supports_pump_abnormal:
             frames = self._op_frames_from(state_data)
             state.update_pump_abnormal_from_frames(frames)
@@ -3505,7 +3600,9 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
             }
         )
 
-    async def _log_h7152_debug_openapi_event(self, instance: str, state_list: list[dict[str, Any]]) -> None:
+    async def _log_h7152_debug_openapi_event(
+        self, instance: str, state_list: list[dict[str, Any]]
+    ) -> None:
         """TEMPORARY: sibling of _log_h7152_debug_frame for the OpenAPI
         event-push channel (``waterFullEvent`` and friends).
 
@@ -3545,7 +3642,9 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
 
         try:
             await self.hass.async_add_executor_job(_append)
-        except OSError as err:  # noqa: BLE001 — never let a debug aid break state handling
+        except (
+            OSError
+        ) as err:  # noqa: BLE001 — never let a debug aid break state handling
             _LOGGER.debug("H7152 debug log write failed: %s", err)
 
     @callback
@@ -3731,7 +3830,9 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
             state = await self._api_client.get_device_state(device_id, device.sku)
             self._record_transport_success(device_id, "cloud_api")
             if device.mqtt_outlet_count:
-                self._apply_outlet_mask(device, state, self._raw_power_switch_value(device_id))
+                self._apply_outlet_mask(
+                    device, state, self._raw_power_switch_value(device_id)
+                )
 
             # Preserve optimistic state fields that API doesn't reliably return.
             # Clear them when device is turned off (no longer active).
@@ -3850,12 +3951,18 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
                 # no field for it at all, so the fresh state has None. Preserve
                 # the push-derived value across the poll or the sensor flickers
                 # to "unknown" every poll cycle (same class of bug as #118/#124).
-                if existing_state.pump_abnormal is not None and state.pump_abnormal is None:
+                if (
+                    existing_state.pump_abnormal is not None
+                    and state.pump_abnormal is None
+                ):
                     state.pump_abnormal = existing_state.pump_abnormal
                 # Hose-connection mode (H7152) is decoded only from the same
                 # AWS IoT push frame (see update_dehumidifier_mode_from_frames)
                 # — same preserve-across-poll need as pump_abnormal above.
-                if existing_state.dehumidifier_mode is not None and state.dehumidifier_mode is None:
+                if (
+                    existing_state.dehumidifier_mode is not None
+                    and state.dehumidifier_mode is None
+                ):
                     state.dehumidifier_mode = existing_state.dehumidifier_mode
                 # Occupancy (H5127) is a momentary push event; the developer
                 # /device/state poll returns only `online` for it (never the
@@ -3871,13 +3978,25 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
                 # values across or the fan entity would fall back to its
                 # restored state on every poll (issue #181). Toggles the poll
                 # DID return (e.g. socketToggle1 on the H5089) win.
-                if existing_state.ceiling_fan_on is not None and state.ceiling_fan_on is None:
+                if (
+                    existing_state.ceiling_fan_on is not None
+                    and state.ceiling_fan_on is None
+                ):
                     state.ceiling_fan_on = existing_state.ceiling_fan_on
-                if existing_state.ceiling_fan_speed is not None and state.ceiling_fan_speed is None:
+                if (
+                    existing_state.ceiling_fan_speed is not None
+                    and state.ceiling_fan_speed is None
+                ):
                     state.ceiling_fan_speed = existing_state.ceiling_fan_speed
-                if existing_state.ceiling_fan_reverse is not None and state.ceiling_fan_reverse is None:
+                if (
+                    existing_state.ceiling_fan_reverse is not None
+                    and state.ceiling_fan_reverse is None
+                ):
                     state.ceiling_fan_reverse = existing_state.ceiling_fan_reverse
-                if existing_state.ceiling_fan_swing is not None and state.ceiling_fan_swing is None:
+                if (
+                    existing_state.ceiling_fan_swing is not None
+                    and state.ceiling_fan_swing is None
+                ):
                     state.ceiling_fan_swing = existing_state.ceiling_fan_swing
                 for toggle_instance, toggle_value in existing_state.toggles.items():
                     state.toggles.setdefault(toggle_instance, toggle_value)
@@ -3959,7 +4078,9 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
         return None
 
     @staticmethod
-    def _apply_outlet_mask(device: GoveeDevice, state: GoveeDeviceState, value: Any) -> None:
+    def _apply_outlet_mask(
+        device: GoveeDevice, state: GoveeDeviceState, value: Any
+    ) -> None:
         """Decode a multi-outlet plug's on/off bitmask into per-outlet toggles.
 
         Both the AWS IoT push ``onOff`` and the Developer API ``powerSwitch``
@@ -3978,7 +4099,9 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
             state.toggles[f"outlet{index + 1}"] = bool(value & (1 << index))
         state.power_state = value != 0
 
-    async def async_set_mqtt_outlet(self, device_id: str, outlet_index: int, enabled: bool) -> bool:
+    async def async_set_mqtt_outlet(
+        self, device_id: str, outlet_index: int, enabled: bool
+    ) -> bool:
         """Switch one outlet of a multi-outlet plug over AWS IoT (issue #184).
 
         Publishes the native ``turn`` command with homebridge-govee's bitmask
@@ -4000,7 +4123,9 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
         topic = await self._ensure_device_topic(device_id)
         bit = 1 << outlet_index
         value = (bit << 4) | (bit if enabled else 0)
-        ok = await self._mqtt_client.async_publish_command(topic, "turn", {"val": value})
+        ok = await self._mqtt_client.async_publish_command(
+            topic, "turn", {"val": value}
+        )
         self._record_local_command(
             device_id,
             device.sku,
@@ -4018,9 +4143,7 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
         self.async_set_updated_data(self._states)
         return True
 
-    async def async_send_fan_oscillation(
-        self, device_id: str, enabled: bool
-    ) -> bool:
+    async def async_send_fan_oscillation(self, device_id: str, enabled: bool) -> bool:
         """Send a Tower-Fan oscillation on/off frame over MQTT.
 
         Reverse-engineered path for the SKUs in ``MQTT_OSCILLATION_SKUS``,
@@ -4036,9 +4159,7 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
         if not device:
             return False
         tail = (
-            self._mqtt_client.fan_swing_tail(device_id)
-            if self._mqtt_client
-            else None
+            self._mqtt_client.fan_swing_tail(device_id) if self._mqtt_client else None
         )
         ok = await self._ble_manager.async_send_fan_oscillation(
             device_id, device.sku, enabled, tail
@@ -4440,7 +4561,9 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
         self._record_transport_success(device_id, "lan")
         self._clear_lan_write_misses(device_id)
         self._apply_lan_read(device_id, reply)
-        self._record_local_command(device_id, device.sku, "lan", command, delivered=True)
+        self._record_local_command(
+            device_id, device.sku, "lan", command, delivered=True
+        )
         return True
 
     def _lan_write_confirmed(
@@ -4801,7 +4924,9 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
             color = (state.last_color or state.color) if state else None
             if color is None or color.as_packed_int == 0:
                 color = RGBColor(255, 255, 255)
-            success = await self.async_control_device(device_id, ColorCommand(color=color))
+            success = await self.async_control_device(
+                device_id, ColorCommand(color=color)
+            )
             if success and state is not None:
                 state.apply_optimistic_dreamview(False)
             _LOGGER.debug(
@@ -4974,7 +5099,10 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
             state.apply_optimistic_power(command.power_on)
         elif isinstance(command, BrightnessCommand):
             state.apply_optimistic_brightness(command.brightness)
-        elif isinstance(command, RangeCommand) and command.range_instance == INSTANCE_HUMIDITY:
+        elif (
+            isinstance(command, RangeCommand)
+            and command.range_instance == INSTANCE_HUMIDITY
+        ):
             # Dehumidifier setpoint (H7152 dial, H7150 reinforcement write) —
             # the poll returns "" for range::humidity, so keep it optimistically
             # (issues #114/#118).
@@ -5200,6 +5328,10 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
         if self._probe_poll_unsub:
             self._probe_poll_unsub()
             self._probe_poll_unsub = None
+        # Cancel periodic MQTT status re-query
+        if self._status_poll_unsub:
+            self._status_poll_unsub()
+            self._status_poll_unsub = None
 
         # Disconnect all BLE devices
         for ble_device in self._ble_devices.values():

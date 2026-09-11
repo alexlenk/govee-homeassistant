@@ -2144,6 +2144,186 @@ class TestWaterDetectorPollInterval:
         assert seen["delay"] == 300
 
 
+class TestMqttStatusPollInterval:
+    """The MQTT status re-query interval is a user-configurable option.
+
+    Devices are largely poll-triggered responders rather than autonomous
+    pushers (see async_publish_status_query / docs/govee-protocol-reference.md
+    §9.5) — this is what keeps state fresh without the Govee app open.
+    """
+
+    def _coord_with_options(self, options):
+        import custom_components.govee.coordinator as coord_mod
+
+        config_entry = MagicMock()
+        config_entry.entry_id = "test_entry"
+        config_entry.options = options
+        return coord_mod.GoveeCoordinator(
+            hass=MagicMock(),
+            config_entry=config_entry,
+            api_client=MagicMock(),
+            iot_credentials=MagicMock(token="tok"),
+            poll_interval=60,
+        )
+
+    @staticmethod
+    def _device(device_id, is_group=False):
+        return GoveeDevice(
+            device_id=device_id,
+            sku="H6001",
+            name=device_id,
+            device_type="devices.types.light",
+            capabilities=(),
+            is_group=is_group,
+        )
+
+    def test_default_when_option_unset(self):
+        coord = self._coord_with_options({})
+        assert coord._mqtt_status_poll_interval == const.DEFAULT_MQTT_STATUS_INTERVAL
+
+    def test_configured_value_is_used(self):
+        coord = self._coord_with_options({const.CONF_MQTT_STATUS_INTERVAL: 600})
+        assert coord._mqtt_status_poll_interval == 600
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            const.MIN_MQTT_STATUS_INTERVAL - 1,
+            const.MAX_MQTT_STATUS_INTERVAL + 1,
+            "not-a-number",
+            None,
+        ],
+    )
+    def test_out_of_range_or_bad_value_falls_back(self, value):
+        """Hand-edited options must not arm a bad timer."""
+        coord = self._coord_with_options({const.CONF_MQTT_STATUS_INTERVAL: value})
+        assert coord._mqtt_status_poll_interval == const.DEFAULT_MQTT_STATUS_INTERVAL
+
+    def test_schedule_uses_configured_interval(self, monkeypatch):
+        import custom_components.govee.coordinator as coord_mod
+
+        coord = self._coord_with_options({const.CONF_MQTT_STATUS_INTERVAL: 90})
+        seen = {}
+
+        def _capture(hass, delay, callback):
+            seen["delay"] = delay
+            return lambda: None
+
+        monkeypatch.setattr(coord_mod, "async_call_later", _capture)
+        coord._schedule_status_poll()
+
+        assert seen["delay"] == 90
+
+    def test_reschedules_after_each_callback(self, monkeypatch):
+        """The timer re-arms itself so polling continues indefinitely."""
+        import custom_components.govee.coordinator as coord_mod
+
+        coord = self._coord_with_options({})
+        calls: list[int] = []
+
+        def _capture(hass, delay, callback):
+            calls.append(delay)
+            return lambda: None
+
+        monkeypatch.setattr(coord_mod, "async_call_later", _capture)
+
+        async def _noop():
+            return None
+
+        coord._poll_mqtt_status = _noop
+        asyncio.get_event_loop().run_until_complete(coord._status_poll_callback())
+
+        assert calls == [const.DEFAULT_MQTT_STATUS_INTERVAL]
+
+    def test_poll_targets_exclude_groups_and_topicless_devices(self):
+        coord = self._coord_with_options({})
+        coord._devices = {
+            "A": self._device("A"),
+            "B": self._device("B", is_group=True),
+            "C": self._device("C"),
+        }
+        coord._device_topics = {"A": "GD/a"}  # B has no topic; C never got one
+
+        assert coord._mqtt_status_poll_targets == ["A"]
+
+    @pytest.mark.asyncio
+    async def test_poll_queries_every_eligible_device(self):
+        coord = self._coord_with_options({})
+        coord._devices = {
+            "A": self._device("A"),
+            "B": self._device("B"),
+        }
+        coord._device_topics = {"A": "GD/a", "B": "GD/b"}
+        mqtt_client = MagicMock()
+        mqtt_client.connected = True
+        mqtt_client.async_publish_status_query = AsyncMock(return_value=True)
+        coord._mqtt_client = mqtt_client
+
+        await coord._poll_mqtt_status()
+
+        from unittest.mock import call
+
+        assert mqtt_client.async_publish_status_query.await_args_list == [
+            call("GD/a"),
+            call("GD/b"),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_poll_is_a_no_op_without_a_connected_client(self):
+        coord = self._coord_with_options({})
+        coord._devices = {"A": self._device("A")}
+        coord._device_topics = {"A": "GD/a"}
+        coord._mqtt_client = None
+
+        await coord._poll_mqtt_status()  # must not raise
+
+        mqtt_client = MagicMock()
+        mqtt_client.connected = False
+        mqtt_client.async_publish_status_query = AsyncMock()
+        coord._mqtt_client = mqtt_client
+
+        await coord._poll_mqtt_status()
+
+        mqtt_client.async_publish_status_query.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_async_setup_polls_immediately_before_scheduling(self, monkeypatch):
+        """A reload must not leave devices stale for a full interval.
+
+        Mirrors the standalone water-detector poll's own startup wiring: fire
+        once immediately, then arm the recurring timer.
+        """
+        import custom_components.govee.coordinator as coord_mod
+
+        coord = self._coord_with_options({})
+        order: list[str] = []
+
+        async def _noop():
+            return None
+
+        monkeypatch.setattr(coord, "_discover_devices", _noop)
+        monkeypatch.setattr(coord, "_start_mqtt", _noop)
+        monkeypatch.setattr(coord, "_fetch_device_topics", _noop)
+        monkeypatch.setattr(coord, "_start_openapi_events", _noop)
+        monkeypatch.setattr(coord, "_discover_leak_sensors", _noop)
+        monkeypatch.setattr(coord, "_discover_bff_thermometers", _noop)
+        monkeypatch.setattr(coord, "_async_setup_lan", _noop)
+
+        async def _poll():
+            order.append("poll")
+
+        def _schedule():
+            order.append("schedule")
+
+        monkeypatch.setattr(coord, "_poll_mqtt_status", _poll)
+        monkeypatch.setattr(coord, "_schedule_status_poll", _schedule)
+        monkeypatch.setattr(coord_mod, "async_call_later", lambda *a, **k: None)
+
+        await coord._async_setup()
+
+        assert order == ["poll", "schedule"]
+
+
 class _AsyncCM:
     """Minimal async context manager yielding a configured inner mock."""
 
@@ -2274,9 +2454,7 @@ class TestBffThermometerDiscovery:
         assert state.sensor_humidity == 47.1
         assert state.battery == 88
         assert coord._devices[did].hub_device_id == "11:22:33:44:55:66:77:88"
-        assert coord._bff_thermo_hubs == {
-            "11:22:33:44:55:66:77:88": {"sku": "H5044"}
-        }
+        assert coord._bff_thermo_hubs == {"11:22:33:44:55:66:77:88": {"sku": "H5044"}}
         coord._schedule_bff_poll.assert_called_once()
 
     @pytest.mark.asyncio
@@ -2433,26 +2611,20 @@ class TestBffThermometerDiscovery:
         coord, coord_mod = self._coord()
         coord._bff_thermo_hubs = {"11:22:33:44:55:66:77:88": {"sku": "H5044"}}
         device_reg = MagicMock()
-        monkeypatch.setattr(
-            coord_mod.dr, "async_get", lambda _hass: device_reg
-        )
+        monkeypatch.setattr(coord_mod.dr, "async_get", lambda _hass: device_reg)
 
         coord.register_thermo_hubs()
 
         device_reg.async_get_or_create.assert_called_once()
         kwargs = device_reg.async_get_or_create.call_args.kwargs
-        assert kwargs["identifiers"] == {
-            (coord_mod.DOMAIN, "11:22:33:44:55:66:77:88")
-        }
+        assert kwargs["identifiers"] == {(coord_mod.DOMAIN, "11:22:33:44:55:66:77:88")}
         assert kwargs["model"] == "H5044"
 
     def test_register_thermo_hubs_noop_when_empty(self, monkeypatch):
         coord, coord_mod = self._coord()
         coord._bff_thermo_hubs = {}
         device_reg = MagicMock()
-        monkeypatch.setattr(
-            coord_mod.dr, "async_get", lambda _hass: device_reg
-        )
+        monkeypatch.setattr(coord_mod.dr, "async_get", lambda _hass: device_reg)
 
         coord.register_thermo_hubs()
 
@@ -2739,7 +2911,9 @@ class TestLanLifecycle:
         ]
 
     @staticmethod
-    def _patch_lan(monkeypatch, coord_mod, *, scan, client, probe=None, broadcasts=None):
+    def _patch_lan(
+        monkeypatch, coord_mod, *, scan, client, probe=None, broadcasts=None
+    ):
         """Patch the LAN module helpers the coordinator imported.
 
         ``probe`` (optional dict) records whether the scan ran and how many
@@ -2777,7 +2951,9 @@ class TestLanLifecycle:
         """async_start that degrades (available False) -> client None, stopped."""
         coord, coord_mod = self._coord()
         client = _FakeLanClient(available=False)
-        self._patch_lan(monkeypatch, coord_mod, scan=self._matching_scan(), client=client)
+        self._patch_lan(
+            monkeypatch, coord_mod, scan=self._matching_scan(), client=client
+        )
 
         await coord._async_setup_lan()  # must not raise
 
@@ -2792,7 +2968,11 @@ class TestLanLifecycle:
         probe: dict[str, Any] = {}
         client = _FakeLanClient(available=True)
         self._patch_lan(
-            monkeypatch, coord_mod, scan=self._matching_scan(), client=client, probe=probe
+            monkeypatch,
+            coord_mod,
+            scan=self._matching_scan(),
+            client=client,
+            probe=probe,
         )
 
         await coord._async_setup_lan()
@@ -2807,7 +2987,9 @@ class TestLanLifecycle:
         """A scan that correlates to a device_id enables LAN and keeps the client."""
         coord, coord_mod = self._coord()
         client = _FakeLanClient(available=True)
-        self._patch_lan(monkeypatch, coord_mod, scan=self._matching_scan(), client=client)
+        self._patch_lan(
+            monkeypatch, coord_mod, scan=self._matching_scan(), client=client
+        )
 
         await coord._async_setup_lan()
 
@@ -2892,7 +3074,9 @@ class TestLanLifecycle:
         """Any raise after the socket opens stops the client before propagating."""
         coord, coord_mod = self._coord()
         client = _FakeLanClient(available=True)
-        self._patch_lan(monkeypatch, coord_mod, scan=self._matching_scan(), client=client)
+        self._patch_lan(
+            monkeypatch, coord_mod, scan=self._matching_scan(), client=client
+        )
 
         def _boom(*args, **kwargs):
             raise RuntimeError("correlation blew up")
@@ -2911,7 +3095,9 @@ class TestLanLifecycle:
         """A bad LAN-targets option is ignored, not fatal — LAN still sets up."""
         coord, coord_mod = self._coord(options={"lan_targets": "not-an-ip/8"})
         client = _FakeLanClient(available=True)
-        self._patch_lan(monkeypatch, coord_mod, scan=self._matching_scan(), client=client)
+        self._patch_lan(
+            monkeypatch, coord_mod, scan=self._matching_scan(), client=client
+        )
 
         await coord._async_setup_lan()  # LanTargetError swallowed
 
@@ -2993,7 +3179,9 @@ class TestLanLifecycle:
         # No _lan_devices entry maps to this IP -> unknown source, skip + rescan.
         assert coord._on_lan_dev_status("10.0.0.5", status) is None
         assert coord._states[self.DEVICE_ID] == before  # untouched
-        assert coord._last_lan_rescan == float("-inf")  # re-correlation forced (blocking #3)
+        assert coord._last_lan_rescan == float(
+            "-inf"
+        )  # re-correlation forced (blocking #3)
 
 
 class _FakeReadClient:
@@ -3025,7 +3213,10 @@ class TestLanReadPath:
         from custom_components.govee.api.lan_client import LanDevStatus
 
         defaults = dict(
-            on=True, brightness_0_100=80, color=RGBColor(255, 0, 0), color_temp_kelvin=None
+            on=True,
+            brightness_0_100=80,
+            color=RGBColor(255, 0, 0),
+            color_temp_kelvin=None,
         )
         defaults.update(kw)
         return LanDevStatus(**defaults)
@@ -3057,7 +3248,9 @@ class TestLanReadPath:
             poll_interval=60,
         )
         caps = (
-            GoveeCapability(type=CAPABILITY_ON_OFF, instance=INSTANCE_POWER, parameters={}),
+            GoveeCapability(
+                type=CAPABILITY_ON_OFF, instance=INSTANCE_POWER, parameters={}
+            ),
             GoveeCapability(
                 type=CAPABILITY_RANGE,
                 instance=INSTANCE_BRIGHTNESS,
@@ -3480,9 +3673,7 @@ class _FakeWriteClient:
         self.send_calls: list[tuple[str, str, dict[str, Any]]] = []
         self.read_calls: list[tuple[str, float]] = []
 
-    async def async_send_command(
-        self, ip: str, cmd: str, data: dict[str, Any]
-    ) -> bool:
+    async def async_send_command(self, ip: str, cmd: str, data: dict[str, Any]) -> bool:
         self.send_calls.append((ip, cmd, data))
         return self.send_result
 
@@ -3752,7 +3943,12 @@ class TestTryLanCommand:
         # Many consecutive misses (well past the suppress threshold): the lan
         # transport stays available the whole time — health is read-driven.
         for _ in range(LAN_WRITE_SUPPRESS_THRESHOLD + 2):
-            assert await coord._try_lan_command(self.DEVICE_ID, dev, PowerCommand(power_on=True)) is False
+            assert (
+                await coord._try_lan_command(
+                    self.DEVICE_ID, dev, PowerCommand(power_on=True)
+                )
+                is False
+            )
             health = coord._transport.get(self.DEVICE_ID, "lan")
             assert health.is_available is True
             assert health.last_failure_reason is None
@@ -3769,12 +3965,19 @@ class TestTryLanCommand:
 
         # Reach the threshold; each attempt sends + reads (paying the timeout).
         for _ in range(LAN_WRITE_SUPPRESS_THRESHOLD):
-            await coord._try_lan_command(self.DEVICE_ID, dev, PowerCommand(power_on=True))
+            await coord._try_lan_command(
+                self.DEVICE_ID, dev, PowerCommand(power_on=True)
+            )
         sends_at_threshold = len(client.send_calls)
         assert coord._lan_writes_suppressed(self.DEVICE_ID) is True
 
         # Next command is suppressed: no further send/read, immediate fall-through.
-        assert await coord._try_lan_command(self.DEVICE_ID, dev, PowerCommand(power_on=True)) is False
+        assert (
+            await coord._try_lan_command(
+                self.DEVICE_ID, dev, PowerCommand(power_on=True)
+            )
+            is False
+        )
         assert len(client.send_calls) == sends_at_threshold  # no new wire traffic
         # LAN reads remain available (sensor stays Connected).
         assert coord._transport.get(self.DEVICE_ID, "lan").is_available is True
@@ -3789,14 +3992,18 @@ class TestTryLanCommand:
         dev = coord._devices[self.DEVICE_ID]
 
         for _ in range(LAN_WRITE_SUPPRESS_THRESHOLD):
-            await coord._try_lan_command(self.DEVICE_ID, dev, PowerCommand(power_on=True))
+            await coord._try_lan_command(
+                self.DEVICE_ID, dev, PowerCommand(power_on=True)
+            )
         assert coord._lan_writes_suppressed(self.DEVICE_ID) is True
 
         # An inbound read lands: LAN available, but writes stay suppressed.
         coord._apply_lan_read(self.DEVICE_ID, self._status())
         assert coord._transport.get(self.DEVICE_ID, "lan").is_available is True
         assert coord._lan_writes_suppressed(self.DEVICE_ID) is True
-        assert coord._lan_write_misses.get(self.DEVICE_ID) == LAN_WRITE_SUPPRESS_THRESHOLD
+        assert (
+            coord._lan_write_misses.get(self.DEVICE_ID) == LAN_WRITE_SUPPRESS_THRESHOLD
+        )
 
     @pytest.mark.asyncio
     async def test_confirmed_write_rearms_suppressed_writes(self):
@@ -3809,14 +4016,21 @@ class TestTryLanCommand:
         dev = coord._devices[self.DEVICE_ID]
 
         for _ in range(LAN_WRITE_SUPPRESS_THRESHOLD):
-            await coord._try_lan_command(self.DEVICE_ID, dev, PowerCommand(power_on=True))
+            await coord._try_lan_command(
+                self.DEVICE_ID, dev, PowerCommand(power_on=True)
+            )
         assert coord._lan_writes_suppressed(self.DEVICE_ID) is True
 
         # Manually clear the cooldown so the next write probes LAN; this time the
         # device confirms (reports ON) -> streak + cooldown cleared, returns True.
         coord._lan_write_suppressed_until.clear()
         client.read_reply = self._status(on=True)
-        assert await coord._try_lan_command(self.DEVICE_ID, dev, PowerCommand(power_on=True)) is True
+        assert (
+            await coord._try_lan_command(
+                self.DEVICE_ID, dev, PowerCommand(power_on=True)
+            )
+            is True
+        )
         assert self.DEVICE_ID not in coord._lan_write_misses
         assert self.DEVICE_ID not in coord._lan_write_suppressed_until
 
@@ -4202,9 +4416,7 @@ class TestHumidityVerificationPoll:
         coord = self._coord()
         record = {"capability": {"instance": "workMode"}}
         coord._api_client.peek_last_command_record = MagicMock(return_value=record)
-        coord._api_client.get_device_state = AsyncMock(
-            side_effect=RuntimeError("boom")
-        )
+        coord._api_client.get_device_state = AsyncMock(side_effect=RuntimeError("boom"))
 
         await coord.async_control_device(
             self.DEVICE_ID, WorkModeCommand(work_mode=3, mode_value=45)
