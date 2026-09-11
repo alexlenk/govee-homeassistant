@@ -278,6 +278,9 @@
       "last_command_sent": {
         "name": "Last Command Sent"
       },
+      "mqtt_last_received_device": {
+        "name": "Last MQTT Received"
+      },
       "leak_battery": {
         "name": "Battery"
       },
