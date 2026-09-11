@@ -201,24 +201,6 @@ CkcO8DdZEv8tmZQoTipPNU0zWgIxAOp1AE47xDqUEpHJWEadIRNyp4iciuRMStuW
 # Type for state update callback
 StateUpdateCallback = Callable[[str, dict[str, Any]], None]
 GiveUpCallback = Callable[[int, str], None]
-# device_id, raw parsed JSON payload, decoded op.command frames (not base64).
-# Fires for EVERY inbound message regardless of cmd (status/multiSync/ptReal/
-# unrecognised) — unlike on_state_update, which only fires for the "status"
-# shape. TEMPORARY: added for the H7152 reverse-engineering debug log (see
-# GoveeCoordinator._log_h7152_debug_frame) — multiSync/ptReal never reach
-# on_state_update at all (they return early below), so without this hook
-# any signal riding those message types would be invisible to that log.
-RawMessageCallback = Callable[[str, dict[str, Any], list[bytes]], None]
-# topic, raw decoded payload string — fired before ANY parsing/filtering,
-# including the "msg"-wrapped unwrap-or-drop branch that RawMessageCallback
-# never sees a message pass. TEMPORARY: added because RawMessageCallback
-# turned out to still be blind to one shape — a "msg"-wrapped payload
-# lacking a top-level "device"+"state" pair (e.g. a command/read-response
-# envelope) is silently dropped by _handle_message's own unwrap logic
-# before RawMessageCallback's call site is ever reached. AnyMessageCallback
-# runs ahead of that drop so nothing riding an unrecognised envelope shape
-# is invisible to the H7152 debug log.
-AnyMessageCallback = Callable[[str, str], None]
 """Invoked when the reconnect loop exhausts MAX_RECONNECT_ATTEMPTS.
 Args: (attempts_made, last_error_message)."""
 
@@ -340,9 +322,6 @@ class GoveeAwsIotClient:
         on_give_up: GiveUpCallback | None = None,
         on_connected: Callable[[], None] | None = None,
         on_disconnected: Callable[[], None] | None = None,
-        on_raw_message: RawMessageCallback | None = None,
-        on_any_message: AnyMessageCallback | None = None,
-        attempt_wildcard_subscribe: bool = False,
     ) -> None:
         """Initialize the AWS IoT MQTT client.
 
@@ -352,33 +331,17 @@ class GoveeAwsIotClient:
             on_give_up: Optional callback fired ONCE when MAX_RECONNECT_ATTEMPTS
                 consecutive attempts have failed. Use to surface a repair
                 issue; the loop keeps retrying regardless.
-            on_raw_message: Optional callback(device_id, data, frames) fired
-                for every inbound message regardless of cmd — see
-                RawMessageCallback's docstring.
-            on_any_message: Optional callback(topic, payload_str) fired for
-                every inbound message before any parsing/filtering at all —
-                see AnyMessageCallback's docstring.
             on_connected: Optional callback fired after every successful
                 CONNACK + SUBACK, so the caller can clear that repair issue.
             on_disconnected: Optional callback fired when a live session
                 drops, so status entities reflect it immediately instead of
                 on the next poll.
-            attempt_wildcard_subscribe: TEMPORARY diagnostic. If True, also
-                subscribes to `<account_topic>/#` after the normal account
-                topic is up, purely to observe whether AWS IoT's per-cert
-                policy allows seeing sibling/child topics under the
-                account's own namespace beyond that one exact topic. See
-                _try_wildcard_subscribe's docstring. Defaults to False — most
-                installs have no reason to probe beyond the account topic.
         """
         self._credentials = credentials
         self._on_state_update = on_state_update
         self._on_give_up = on_give_up
         self._on_connected = on_connected
         self._on_disconnected = on_disconnected
-        self._on_raw_message = on_raw_message
-        self._on_any_message = on_any_message
-        self._attempt_wildcard_subscribe = attempt_wildcard_subscribe
         self._running = False
         self._connected = False
         self._task: asyncio.Task[None] | None = None
@@ -602,73 +565,6 @@ class GoveeAwsIotClient:
             )
         return self._ssl_context
 
-    async def _try_wildcard_subscribe(self, client: Any) -> None:
-        """TEMPORARY diagnostic: subscribe to ``<account_topic>/#`` alongside
-        the account topic itself, to check whether AWS IoT's per-certificate
-        policy allows seeing sibling/child topics under the account's own
-        namespace that this integration doesn't otherwise subscribe to.
-
-        Scoped under the account's own topic, NOT a bare "#" — a bare "#"
-        asks for literally every topic on the whole regional AWS IoT
-        endpoint (every other Govee customer's traffic, every other AWS IoT
-        tenant sharing that endpoint), which essentially no sanely-configured
-        multi-tenant policy grants; a refusal there would confirm nothing
-        about this account's own policy. ``<account_topic>/#`` asks only for
-        topics AWS IoT policies commonly group under: even if the specific
-        subtopic name is unknown, an account's own certificate is
-        occasionally scoped with a wildcard resource under its own topic
-        root rather than an exact match, which a scoped probe can reveal and
-        a global one cannot distinguish from a blanket denial.
-
-        Motivation: the H7152 humidity investigation confirmed (by capturing
-        the complete, untouched wire JSON of every message) that live
-        humidity is genuinely absent from the account topic itself. AWS IoT
-        commonly splits state across multiple topics — e.g. a device-shadow-
-        style topic (``$aws/things/<thing-name>/shadow/...``) for "current
-        full device state" — but that lives under an entirely different root
-        (``$aws/...``, not under the account topic at all), so this probe
-        cannot find a shadow topic even if granted; it only tests for
-        siblings/children of the account's own topic. The expected, still
-        fully informative, outcome is a refused SUBACK (0x80) — multi-tenant
-        account isolation working as intended — which rules out an
-        easy-to-reach second topic under the same root and leaves a shadow
-        topic (needing its thing name derived some other way) as the
-        remaining candidate.
-
-        Best-effort only, called only once the primary account-topic
-        subscription is already confirmed healthy: any failure here (refused
-        SUBACK or a raised exception) must never affect that established
-        session. QoS 0 — this is throwaway diagnostic traffic, not state that
-        needs delivery guarantees. Remove once the H7152 humidity
-        investigation concludes either way.
-        """
-        wildcard_topic = f"{self._credentials.account_topic}/#"
-        try:
-            granted = await client.subscribe(wildcard_topic, qos=0)
-        except (
-            Exception
-        ) as err:  # noqa: BLE001 — diagnostic only, must not break the session
-            _LOGGER.info(
-                "Wildcard subscription to %s attempt failed: %s", wildcard_topic, err
-            )
-            return
-        if _subscription_refused(granted):
-            _LOGGER.info(
-                "Wildcard subscription to %s refused by AWS IoT policy (SUBACK %r) — "
-                "account is scoped to its exact topic, as expected for a multi-tenant "
-                "broker",
-                wildcard_topic,
-                granted,
-            )
-        else:
-            _LOGGER.info(
-                "Wildcard subscription to %s GRANTED (SUBACK %r) — sibling/child topics "
-                "under the account's own namespace may now be visible; watch the H7152 "
-                "debug log for unfamiliar topics",
-                wildcard_topic,
-                granted,
-            )
-
     async def _connection_loop(self) -> None:
         """Maintain the AWS IoT MQTT connection; never stops retrying.
 
@@ -714,9 +610,6 @@ class GoveeAwsIotClient:
                         raise aiomqtt.MqttError(
                             f"account topic subscription refused (SUBACK {granted!r})"
                         )
-
-                    if self._attempt_wildcard_subscribe:
-                        await self._try_wildcard_subscribe(client)
 
                     self._connected = True
                     session_started = time.monotonic()
@@ -883,19 +776,6 @@ class GoveeAwsIotClient:
                 else str(raw_payload)
             )
 
-            # Fires before ANY parsing/filtering below — including the
-            # "msg"-wrapped unwrap-or-drop branch a few lines down, which can
-            # silently `return` on an envelope shape on_raw_message never
-            # sees. Never let a debug hook break real message handling.
-            topic_str = str(getattr(message, "topic", ""))
-            if self._on_any_message is not None:
-                try:
-                    self._on_any_message(topic_str, payload_str)
-                except (
-                    Exception
-                ) as err:  # noqa: BLE001 — debug hook, must not break MQTT
-                    _LOGGER.debug("on_any_message callback failed: %s", err)
-
             # Log every inbound account-topic message before any filtering so a
             # debug capture shows exactly what arrives — used to determine
             # whether standalone water detectors (H5054, issue #62) ever push a
@@ -968,18 +848,6 @@ class GoveeAwsIotClient:
                     and _fb[2] in (0x00, 0x01)
                 ):
                     self._fan_swing_tail[device_id] = list(_fb[3:7])
-
-            # Fires for every message shape (status/multiSync/ptReal/other),
-            # before any cmd-based branch can return early — see
-            # RawMessageCallback's docstring. Never let a debug hook break
-            # real message handling.
-            if self._on_raw_message is not None:
-                try:
-                    self._on_raw_message(device_id, data, frames)
-                except (
-                    Exception
-                ) as err:  # noqa: BLE001 — debug hook, must not break MQTT
-                    _LOGGER.debug("on_raw_message callback failed: %s", err)
 
             cmd = data.get("cmd")
 

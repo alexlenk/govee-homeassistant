@@ -9,9 +9,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import dataclasses
-import json
 import logging
-import os
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from datetime import datetime, timedelta
@@ -199,11 +197,6 @@ LAN_COLOR_TEMP_CONFIRM_TOLERANCE = 150
 
 # BFF polling interval for leak sensor state (seconds)
 BFF_POLL_INTERVAL = 300  # 5 minutes
-
-# Safety cap for the TEMPORARY H7152 debug log (see _append_h7152_debug_line)
-# — stops appending rather than filling the disk if a capture session runs
-# far longer than intended.
-_H7152_DEBUG_LOG_MAX_BYTES = 5 * 1024 * 1024  # 5 MB
 
 # Field names a probe frame may carry. Derived from the dataclass so a new
 # channel cannot be silently dropped by the merge.
@@ -1693,27 +1686,12 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
         if not self._iot_credentials:
             return
 
-        # TEMPORARY, DISABLED: the "#"-under-account-topic wildcard subscribe
-        # attempt (see GoveeAwsIotClient._try_wildcard_subscribe) is suspected
-        # of causing AWS IoT to drop the whole session rather than cleanly
-        # refuse the extra subscription — a live install saw MQTT go silent
-        # (no debug-log entries, a "dropped early" reconnect warning) right
-        # after upgrading to the build that enabled this. Hardcoded off
-        # pending confirmation; do not re-enable by flipping this back to the
-        # supports_pump_abnormal check without first fixing the underlying
-        # cause (e.g. attempting it at most once ever, not on every
-        # reconnect, and/or verifying it doesn't get the session kicked).
-        has_h7152 = False
-
         self._mqtt_client = GoveeAwsIotClient(
             credentials=self._iot_credentials,
             on_state_update=self._on_mqtt_state_update,
             on_give_up=self._on_mqtt_give_up,
             on_connected=self._on_mqtt_connected,
             on_disconnected=self._on_mqtt_disconnected,
-            on_raw_message=self._on_mqtt_raw_message,
-            on_any_message=self._on_mqtt_any_message,
-            attempt_wildcard_subscribe=has_h7152,
         )
 
         if self._mqtt_client.available:
@@ -1778,17 +1756,6 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
         if device is None:
             _LOGGER.debug("OpenAPI event for unknown device %s (%s)", device_id, sku)
             return
-
-        if device.supports_pump_abnormal:
-            # See _log_h7152_debug_frame — sibling capture for this channel.
-            # The client's own recent_events ring buffer already holds this,
-            # but it's volatile (lost on restart, 64-entry account-wide cap),
-            # not durable enough for a multi-day capture.
-            self._config_entry.async_create_background_task(
-                self.hass,
-                self._log_h7152_debug_openapi_event(instance, state_list),
-                name="govee_h7152_debug_log_openapi",
-            )
 
         value: int | None = None
         for entry in state_list:
@@ -3350,97 +3317,6 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
         self._schedule_bff_leak_poll()
 
     @callback
-    def _on_mqtt_raw_message(
-        self, device_id: str, data: dict[str, Any], frames: list[bytes]
-    ) -> None:
-        """TEMPORARY: fan-out for EVERY inbound MQTT message, not just "status".
-
-        _on_mqtt_state_update (via _log_h7152_debug_frame) already logs
-        status pushes with their decoded sensor_temperature/pump_abnormal
-        values — this covers everything ELSE (multiSync, ptReal, any other
-        cmd), which never reaches that handler at all. The H7152 debug log
-        needs that coverage in case humidity or the tank-vs-pump-mode signal
-        rides one of those instead of a status push. Remove alongside the
-        rest of the H7152 debug-log scaffolding.
-        """
-        if data.get("cmd") == "status":
-            return  # already logged, with decoded values, by _on_mqtt_state_update
-        device = self._devices.get(device_id)
-        if device is None or not device.supports_pump_abnormal:
-            return
-        self._config_entry.async_create_background_task(
-            self.hass,
-            self._log_h7152_debug_raw_message(data, frames),
-            name="govee_h7152_debug_log_raw",
-        )
-
-    async def _log_h7152_debug_raw_message(
-        self, data: dict[str, Any], frames: list[bytes]
-    ) -> None:
-        """TEMPORARY: sibling of _log_h7152_debug_frame for non-status pushes
-        (multiSync, ptReal, anything else) — see _on_mqtt_raw_message.
-        """
-        await self._append_h7152_debug_line(
-            {
-                "source": "mqtt_raw",
-                "ts": dt_util.utcnow().isoformat(),
-                "cmd": data.get("cmd"),
-                "type": data.get("type"),
-                "sta": data.get("sta"),
-                "onOff": data.get("onOff"),
-                "result": data.get("result"),
-                "op_frames_hex": [f.hex() for f in frames],
-                "state": data.get("state"),
-            }
-        )
-
-    @callback
-    def _on_mqtt_any_message(self, topic: str, payload_str: str) -> None:
-        """TEMPORARY: catch every inbound MQTT message for an H7152, verbatim,
-        before ANY parsing or filtering.
-
-        `_on_mqtt_raw_message` still misses one shape: a "msg"-wrapped
-        payload lacking a top-level "device"+"state" pair (e.g. a
-        command-accepted ack, or a read-response using a different envelope)
-        is dropped by `_handle_message`'s own unwrap logic before
-        `on_raw_message`'s call site is ever reached — confirmed live: the
-        one `ptReal` sample captured while the Govee app had the H7152's
-        live-readings screen open was itself just such an ack, and *only*
-        that shape has been seen from this channel so far. This hook runs
-        ahead of that drop, so nothing is invisible regardless of shape. A
-        cheap substring match on the known H7152 device ID (no JSON parsing
-        — the whole point is not assuming any structure) keeps this from
-        logging every OTHER device's traffic on the shared account topic.
-        """
-        h7152_ids = [
-            device_id
-            for device_id, device in self._devices.items()
-            if device.supports_pump_abnormal
-        ]
-        if not any(device_id in payload_str for device_id in h7152_ids):
-            return
-        self._config_entry.async_create_background_task(
-            self.hass,
-            self._log_h7152_debug_raw_payload(topic, payload_str),
-            name="govee_h7152_debug_log_any",
-        )
-
-    async def _log_h7152_debug_raw_payload(self, topic: str, payload_str: str) -> None:
-        """TEMPORARY: sibling of _log_h7152_debug_raw_message that logs the
-        untouched wire payload — see _on_mqtt_any_message. Capped well above
-        any observed H7152 message size so nothing is truncated in practice,
-        while still bounding one stray oversized payload.
-        """
-        await self._append_h7152_debug_line(
-            {
-                "source": "mqtt_any",
-                "ts": dt_util.utcnow().isoformat(),
-                "topic": topic,
-                "payload": payload_str[:8192],
-            }
-        )
-
-    @callback
     def _on_mqtt_state_update(self, device_id: str, state_data: dict[str, Any]) -> None:
         """Handle state update from MQTT.
 
@@ -3499,24 +3375,6 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
             state.update_pump_abnormal_from_frames(frames)
             state.update_temperature_from_frames(frames)
             state.update_dehumidifier_mode_from_frames(frames)
-            # TEMPORARY debug aid for the ongoing H7152 reverse-engineering
-            # effort (humidity/byte-5 and the tank-vs-pump-mode distinction
-            # are both still unidentified) — appends the FULL raw push (every
-            # op_frame, not just the two we've already decoded) to a local
-            # file, so a multi-hour/day capture can be diffed against the
-            # app's own history graph in bulk instead of pairing individual
-            # screenshots. Deliberately NOT filtered to known frames — the
-            # whole point is catching whatever we haven't identified yet.
-            # Remove once temperature/humidity/pump-state are all confirmed.
-            self._config_entry.async_create_background_task(
-                self.hass,
-                self._log_h7152_debug_frame(
-                    state_data,
-                    sensor_temperature=state.sensor_temperature,
-                    pump_abnormal=state.pump_abnormal,
-                ),
-                name="govee_h7152_debug_log",
-            )
         if device is not None and device.mqtt_outlet_count:
             self._apply_outlet_mask(device, state, state_data.get("onOff"))
 
@@ -3556,96 +3414,6 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
             except ValueError:
                 continue
         return frames
-
-    async def _log_h7152_debug_frame(
-        self,
-        state_data: dict[str, Any],
-        *,
-        sensor_temperature: float | None,
-        pump_abnormal: bool | None,
-    ) -> None:
-        """TEMPORARY: append the full raw AWS IoT push to the H7152 debug log.
-
-        Debug aid for the ongoing H7152 reverse-engineering effort — NOT a
-        feature. Remove once temperature, humidity (byte offset 5 of the
-        ``aa 10 81 03`` frame is still unidentified), and the tank-vs-pump
-        mode distinction are all confirmed. Deliberately logs every
-        ``op_frame`` verbatim rather than just the two we've already decoded
-        (``aa 10 81 03`` / ``aa 17``) — the whole point of this capture is
-        finding whatever encodes the signals we HAVEN'T identified yet, and a
-        pre-filtered log can't do that. Only ever called for SKUs in
-        PUMP_DEHUMIDIFIER_SKUS (see the call site), so the blast radius of a
-        stray file on disk is limited to devices already being actively
-        reverse-engineered.
-
-        Args:
-            state_data: The MQTT client's state dict for this push (carries
-                ``sta``, ``onOff``, ``result``, and the decoded ``_op_frames``
-                hex list).
-            sensor_temperature: The value just decoded onto the state object,
-                for convenience cross-referencing without re-deriving it.
-            pump_abnormal: Same, for the pump-fault flag.
-        """
-        frames = self._op_frames_from(state_data)
-        await self._append_h7152_debug_line(
-            {
-                "source": "mqtt",
-                "ts": dt_util.utcnow().isoformat(),
-                "sta": state_data.get("sta"),
-                "onOff": state_data.get("onOff"),
-                "result": state_data.get("result"),
-                "op_frames_hex": [f.hex() for f in frames],
-                "sensor_temperature_c": sensor_temperature,
-                "pump_abnormal": pump_abnormal,
-            }
-        )
-
-    async def _log_h7152_debug_openapi_event(
-        self, instance: str, state_list: list[dict[str, Any]]
-    ) -> None:
-        """TEMPORARY: sibling of _log_h7152_debug_frame for the OpenAPI
-        event-push channel (``waterFullEvent`` and friends).
-
-        That channel already keeps its own 64-entry in-memory ring buffer for
-        diagnostics (``GoveeOpenApiEventClient.recent_events``), but it's
-        volatile — lost on restart, capped account-wide — which isn't durable
-        enough for a capture meant to span days. Persists every event for
-        this device to the same debug file instead. Remove alongside
-        _log_h7152_debug_frame.
-        """
-        await self._append_h7152_debug_line(
-            {
-                "source": "openapi_event",
-                "ts": dt_util.utcnow().isoformat(),
-                "instance": instance,
-                "state": state_list,
-            }
-        )
-
-    async def _append_h7152_debug_line(self, line: dict[str, Any]) -> None:
-        """Shared executor-run JSONL append + size guard for the two loggers
-        above. Runs the blocking file I/O in the executor — both callers are
-        reached from sync @callback contexts, and file I/O must never block
-        the event loop.
-        """
-        payload = json.dumps(line)
-
-        def _append() -> None:
-            path = self.hass.config.path("govee_h7152_debug.jsonl")
-            try:
-                if os.path.getsize(path) >= _H7152_DEBUG_LOG_MAX_BYTES:
-                    return
-            except OSError:
-                pass  # doesn't exist yet — fine, this write creates it
-            with open(path, "a", encoding="utf-8") as f:
-                f.write(payload + "\n")
-
-        try:
-            await self.hass.async_add_executor_job(_append)
-        except (
-            OSError
-        ) as err:  # noqa: BLE001 — never let a debug aid break state handling
-            _LOGGER.debug("H7152 debug log write failed: %s", err)
 
     @callback
     def _on_mqtt_connected(self) -> None:
