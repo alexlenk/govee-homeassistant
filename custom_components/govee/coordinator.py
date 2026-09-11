@@ -3287,6 +3287,7 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
             frames = self._op_frames_from(state_data)
             state.update_pump_state_from_frames(frames)
             state.update_dehumidifier_mode_from_frames(frames)
+            state.update_temperature_from_frames(frames)
         if device is not None and device.mqtt_outlet_count:
             self._apply_outlet_mask(device, state, state_data.get("onOff"))
 
