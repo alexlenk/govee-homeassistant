@@ -3403,6 +3403,7 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
             frames = self._op_frames_from(state_data)
             state.update_pump_abnormal_from_frames(frames)
             state.update_temperature_from_frames(frames)
+            state.update_dehumidifier_mode_from_frames(frames)
             # TEMPORARY debug aid for the ongoing H7152 reverse-engineering
             # effort (humidity/byte-5 and the tank-vs-pump-mode distinction
             # are both still unidentified) — appends the FULL raw push (every
@@ -3851,6 +3852,11 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
                 # to "unknown" every poll cycle (same class of bug as #118/#124).
                 if existing_state.pump_abnormal is not None and state.pump_abnormal is None:
                     state.pump_abnormal = existing_state.pump_abnormal
+                # Hose-connection mode (H7152) is decoded only from the same
+                # AWS IoT push frame (see update_dehumidifier_mode_from_frames)
+                # — same preserve-across-poll need as pump_abnormal above.
+                if existing_state.dehumidifier_mode is not None and state.dehumidifier_mode is None:
+                    state.dehumidifier_mode = existing_state.dehumidifier_mode
                 # Occupancy (H5127) is a momentary push event; the developer
                 # /device/state poll returns only `online` for it (never the
                 # bodyAppearedEvent value), so the fresh state has presence=None.

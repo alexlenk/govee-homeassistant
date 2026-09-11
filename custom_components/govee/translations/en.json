@@ -242,6 +242,13 @@
       "sensor_temperature": {
         "name": "Temperature"
       },
+      "govee_dehumidifier_mode": {
+        "name": "Mode",
+        "state": {
+          "pump": "Pump",
+          "tank": "Water Tank"
+        }
+      },
       "sensor_temperature_2": {
         "name": "Probe 2 temperature"
       },
@@ -312,7 +319,7 @@
         "name": "Water Tank Full"
       },
       "govee_pump_abnormal": {
-        "name": "Pump Abnormality"
+        "name": "Pump State"
       },
       "govee_water_leak": {
         "name": "Water Leak"

@@ -279,6 +279,26 @@ class GoveeDeviceState:
     # once the app's "Pump Abnormality" alert clears.
     pump_abnormal: bool | None = None
 
+    # Hose-connection mode for pump-model dehumidifiers (H7152 "Max"),
+    # decoded from byte offset 9 of the AWS IoT ``aa 19`` status frame.
+    # "pump" = drain hose physically connected (app's "Pump Mode"); "tank" =
+    # hose disconnected, draining into the bucket instead (app's "Water Tank
+    # Mode"). Confirmed directly against the app: repeatedly pressing and
+    # holding the device's physical hose-connection button (~5s per hold)
+    # toggled the app's own Mode label in exact lockstep with this byte on
+    # every single transition. See update_dehumidifier_mode_from_frames.
+    #
+    # Byte offset 7 of the same frame also moves (drops on hose removal,
+    # recovers a few seconds after reconnection) but is NOT decoded here —
+    # ruled out as both the mode label (didn't move at all during the
+    # button-hold test above, unlike byte 9) and as pump-motor state (a
+    # frame-by-frame diff against a moment independently confirmed
+    # motor-on and two moments confirmed motor-off showed the entire aa19
+    # frame, byte 7 included, identical across all three — the pump's
+    # running state is not transmitted in this push at all). Its actual
+    # meaning is unresolved; deliberately left undecoded rather than guessed.
+    dehumidifier_mode: str | None = None  # "pump" | "tank"
+
     # Standalone water-leak detector trip (H5054, issue #62). True when water
     # is detected. Arrives via the bodyAppearedEvent event capability — the
     # developer-API device-state poll only returns `online`, so the trip
@@ -703,6 +723,31 @@ class GoveeDeviceState:
         for raw in frames:
             if len(raw) >= 13 and raw[0] == 0xAA and raw[1] == 0x17:
                 self.pump_abnormal = raw[12] == 0x01
+                return True
+        return False
+
+    def update_dehumidifier_mode_from_frames(self, frames: Iterable[bytes]) -> bool:
+        """Apply hose-connection mode from an H7152's AWS IoT ``aa 19``
+        status frame.
+
+        Reverse-engineered from a live test pressing and holding the
+        device's own hose-connection button repeatedly (~5s per hold):
+        byte offset 9 toggled in exact lockstep with the app's Mode label on
+        every single press, in both directions — ``0x01`` while the drain
+        hose reads as connected ("Pump Mode"), ``0x00`` once it doesn't
+        ("Water Tank Mode"). This is the confirmed mode signal; byte offset
+        7 of the same frame also moves but was ruled out for this purpose
+        (see the field docstring) and is deliberately not decoded.
+
+        Args:
+            frames: Decoded (not base64) frames from ``op.command``.
+
+        Returns:
+            True if the frame was recognised.
+        """
+        for raw in frames:
+            if len(raw) >= 10 and raw[0] == 0xAA and raw[1] == 0x19:
+                self.dehumidifier_mode = "pump" if raw[9] == 0x01 else "tank"
                 return True
         return False
 

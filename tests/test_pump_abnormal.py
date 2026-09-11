@@ -38,6 +38,14 @@ FRAME_TEMP_71_1F = bytes.fromhex("aa10810355ff0000000000000000000000000092")
 FRAME_TEMP_72_1F = bytes.fromhex("aa10810369c50000000000000000000000000094")
 FRAME_TEMP_72_3F = bytes.fromhex("aa1081036db000000000000000000000000000e5")
 
+# Verbatim ``aa 19`` frames from a live hose-button test on 2026-09-11 —
+# byte offset 9 confirmed against the app's own Mode label toggling in exact
+# lockstep across five press-and-hold cycles. See
+# update_dehumidifier_mode_from_frames for the full story, including why
+# byte offset 7 (which also moves) is deliberately NOT decoded here.
+FRAME_MODE_PUMP = bytes.fromhex("aa190000000000010101000000000000000000b2")
+FRAME_MODE_TANK = bytes.fromhex("aa190000000000010100000000000000000000b3")
+
 
 def _h7152() -> GoveeDevice:
     return GoveeDevice(
@@ -158,6 +166,49 @@ class TestUpdateTemperatureFromFrames:
         assert state.sensor_temperature == 22.4
 
 
+class TestUpdateDehumidifierModeFromFrames:
+    """Byte offset 9 of the ``aa 19`` frame, confirmed against the app's own
+    Mode label toggling in lockstep across a live hose-button test — see
+    FRAME_MODE_PUMP/FRAME_MODE_TANK's module-level comment.
+    """
+
+    def test_pump_frame_reports_pump(self):
+        state = GoveeDeviceState.create_empty(DEVICE_ID)
+        assert state.update_dehumidifier_mode_from_frames([FRAME_MODE_PUMP]) is True
+        assert state.dehumidifier_mode == "pump"
+
+    def test_tank_frame_reports_tank(self):
+        state = GoveeDeviceState.create_empty(DEVICE_ID)
+        assert state.update_dehumidifier_mode_from_frames([FRAME_MODE_TANK]) is True
+        assert state.dehumidifier_mode == "tank"
+
+    def test_toggles_both_ways(self):
+        """Live/level flag, not edge-latched — tracks the current mode."""
+        state = GoveeDeviceState.create_empty(DEVICE_ID)
+        state.update_dehumidifier_mode_from_frames([FRAME_MODE_TANK])
+        assert state.dehumidifier_mode == "tank"
+
+        state.update_dehumidifier_mode_from_frames([FRAME_MODE_PUMP])
+        assert state.dehumidifier_mode == "pump"
+
+    def test_unrelated_frame_is_not_recognised(self):
+        state = GoveeDeviceState.create_empty(DEVICE_ID)
+        assert state.update_dehumidifier_mode_from_frames([FRAME_UNRELATED]) is False
+        assert state.dehumidifier_mode is None
+
+    def test_short_frame_is_ignored(self):
+        state = GoveeDeviceState.create_empty(DEVICE_ID)
+        short = bytes([0xAA, 0x19, 0x00])
+        assert state.update_dehumidifier_mode_from_frames([short]) is False
+        assert state.dehumidifier_mode is None
+
+    def test_picks_the_right_frame_out_of_a_full_push(self):
+        state = GoveeDeviceState.create_empty(DEVICE_ID)
+        frames = [FRAME_UNRELATED, FRAME_PUMP_OK, FRAME_MODE_TANK]
+        assert state.update_dehumidifier_mode_from_frames(frames) is True
+        assert state.dehumidifier_mode == "tank"
+
+
 class TestPumpAbnormalPreservedAcrossDeveloperPoll:
     """The Developer /device/state poll has no field for this at all — it
     only ever comes from AWS IoT push frames — so a naive poll would flicker
@@ -205,6 +256,20 @@ class TestPumpAbnormalPreservedAcrossDeveloperPoll:
         result = await coord._fetch_device_state(DEVICE_ID, coord._devices[DEVICE_ID])
 
         assert result.pump_abnormal is True
+
+    @pytest.mark.asyncio
+    async def test_dehumidifier_mode_survives_a_poll_that_knows_nothing_about_it(self):
+        coord = self._coord()
+        existing = GoveeDeviceState.create_empty(DEVICE_ID)
+        existing.dehumidifier_mode = "tank"
+        coord._states[DEVICE_ID] = existing
+
+        fresh = GoveeDeviceState.create_empty(DEVICE_ID)
+        coord._api_client.get_device_state = AsyncMock(return_value=fresh)
+
+        result = await coord._fetch_device_state(DEVICE_ID, coord._devices[DEVICE_ID])
+
+        assert result.dehumidifier_mode == "tank"
 
     @pytest.mark.asyncio
     async def test_recovery_is_not_masked_by_a_stale_preserved_value(self):
@@ -651,3 +716,39 @@ class TestTryWildcardSubscribe:
         fake_aws_client.subscribe = AsyncMock(side_effect=RuntimeError("boom"))
 
         await client._try_wildcard_subscribe(fake_aws_client)  # must not raise
+
+
+class TestDehumidifierModeSensor:
+    def _coord(self):
+        import custom_components.govee.coordinator as coord_mod
+
+        hass = MagicMock()
+        config_entry = MagicMock()
+        config_entry.entry_id = "test_entry"
+        coord = coord_mod.GoveeCoordinator(
+            hass=hass,
+            config_entry=config_entry,
+            api_client=MagicMock(),
+            iot_credentials=None,
+            poll_interval=60,
+        )
+        coord._devices[DEVICE_ID] = _h7152()
+        return coord
+
+    def test_native_value_reflects_state(self):
+        from custom_components.govee.sensor import GoveeDehumidifierModeSensor
+
+        coord = self._coord()
+        state = GoveeDeviceState.create_empty(DEVICE_ID)
+        state.dehumidifier_mode = "tank"
+        coord._states[DEVICE_ID] = state
+
+        sensor = GoveeDehumidifierModeSensor(coord, coord._devices[DEVICE_ID])
+        assert sensor.native_value == "tank"
+
+    def test_native_value_none_before_any_push(self):
+        from custom_components.govee.sensor import GoveeDehumidifierModeSensor
+
+        coord = self._coord()
+        sensor = GoveeDehumidifierModeSensor(coord, coord._devices[DEVICE_ID])
+        assert sensor.native_value is None
