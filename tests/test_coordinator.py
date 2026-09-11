@@ -2287,16 +2287,20 @@ class TestMqttStatusPollInterval:
         mqtt_client.async_publish_status_query.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_async_setup_polls_immediately_before_scheduling(self, monkeypatch):
-        """A reload must not leave devices stale for a full interval.
+    async def test_async_setup_schedules_without_polling_immediately(self, monkeypatch):
+        """_async_setup must NOT attempt an immediate query itself.
 
-        Mirrors the standalone water-detector poll's own startup wiring: fire
-        once immediately, then arm the recurring timer.
+        Regression test: _start_mqtt only spawns the connection-loop task and
+        returns before the TLS handshake/CONNACK/SUBACK complete, so a query
+        attempted here would see client.connected still False and silently
+        no-op — confirmed live: state stayed empty until the first scheduled
+        tick, up to a full interval later. The initial query is instead
+        fired from _on_mqtt_connected (see the test below), once a session is
+        actually confirmed live. Setup only needs to arm the recurring timer.
         """
         import custom_components.govee.coordinator as coord_mod
 
         coord = self._coord_with_options({})
-        order: list[str] = []
 
         async def _noop():
             return None
@@ -2309,11 +2313,17 @@ class TestMqttStatusPollInterval:
         monkeypatch.setattr(coord, "_discover_bff_thermometers", _noop)
         monkeypatch.setattr(coord, "_async_setup_lan", _noop)
 
+        poll_called = False
+
         async def _poll():
-            order.append("poll")
+            nonlocal poll_called
+            poll_called = True
+
+        scheduled = False
 
         def _schedule():
-            order.append("schedule")
+            nonlocal scheduled
+            scheduled = True
 
         monkeypatch.setattr(coord, "_poll_mqtt_status", _poll)
         monkeypatch.setattr(coord, "_schedule_status_poll", _schedule)
@@ -2321,7 +2331,27 @@ class TestMqttStatusPollInterval:
 
         await coord._async_setup()
 
-        assert order == ["poll", "schedule"]
+        assert scheduled is True
+        assert poll_called is False
+
+    def test_on_mqtt_connected_polls_status_in_the_background(self):
+        """A confirmed-live session is the reliable trigger for the initial
+        (and every reconnect's) status query — see the regression test above
+        for why _async_setup itself cannot do this reliably.
+        """
+        coord = self._coord_with_options({})
+        coord._config_entry = MagicMock()
+        seen: dict[str, Any] = {}
+
+        def _capture(hass, coro, name=None):
+            seen[name] = coro
+            coro.close()  # avoid an "never awaited" warning; call site is what's under test
+
+        coord._config_entry.async_create_background_task = _capture
+
+        coord._on_mqtt_connected()
+
+        assert "govee_mqtt_connected_status_poll" in seen
 
 
 class _AsyncCM:

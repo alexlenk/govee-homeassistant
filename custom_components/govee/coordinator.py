@@ -1067,16 +1067,15 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
             # Devices are largely poll-triggered responders on their own MQTT
             # topic, not autonomous pushers (see async_publish_status_query) —
             # without this, state could go stale as soon as the Govee app was
-            # closed. Fires once immediately, same as the water-detector poll
-            # above: a reload also restarts this timer, and making the user
-            # wait a full interval after every reload for state that a reload
-            # is often specifically trying to refresh would be a worse
-            # trade-off than the extra request burst. Bounded so a slow/failed
-            # publish degrades to "wait for the first tick" instead of hanging
-            # setup.
-            await self._run_startup_step(
-                self._poll_mqtt_status(), "poll MQTT device status"
-            )
+            # closed. The initial query is fired from _on_mqtt_connected, not
+            # here: _start_mqtt only spawns the connection-loop task and
+            # returns immediately, so a query attempted at this point in setup
+            # would see client.connected still False (the TLS handshake and
+            # CONNACK/SUBACK haven't completed yet) and silently no-op —
+            # confirmed live: state stayed empty until the first scheduled
+            # tick, up to a full interval later. Arm the recurring timer here
+            # regardless, as a backstop independent of when the connection
+            # actually lands.
             self._schedule_status_poll()
 
         # OpenAPI event subscription — needs only the API key (no account
@@ -3426,6 +3425,18 @@ class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
         # The MQTT status sensor and per-device connection-mode sensors read
         # the client; nudge them now rather than on the next poll.
         self.async_set_updated_data(self._states)
+        # Devices are poll-triggered responders (see async_publish_status_query)
+        # — query every device now that a session is actually confirmed live,
+        # rather than waiting up to a full _mqtt_status_poll_interval. This is
+        # the initial query for a fresh connection (the setup-time attempt it
+        # replaced always raced the handshake and lost — see _async_setup) and
+        # also covers every later reconnect, so a drop-and-recover doesn't
+        # leave state stale for up to the full interval either.
+        self._config_entry.async_create_background_task(
+            self.hass,
+            self._poll_mqtt_status(),
+            name="govee_mqtt_connected_status_poll",
+        )
 
     @callback
     def _on_mqtt_disconnected(self) -> None:
