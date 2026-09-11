@@ -709,6 +709,13 @@ class GoveeDeviceState:
         Not documented anywhere (Govee's API, govee2mqtt, or this repo's own
         prior research) — this is the first decode of this frame.
 
+        Known limitation (see ``update_temperature_from_frames`` for the
+        same caveat in more detail): this frame, like the ``aa 10 81 03``
+        temperature/humidity frame, appears to arrive only while a Govee
+        app session is/was recently active — observed live going stale
+        overnight with the app closed. A fault that starts and clears
+        entirely between app sessions may never be reported.
+
         Args:
             frames: Decoded (not base64) frames from ``op.command``.
 
@@ -773,11 +780,19 @@ class GoveeDeviceState:
         2026-09-10 spanning 20.9-22.4°C, superseding this method's earlier
         best-effort linear regression on byte 4 alone, plus 4 independent
         raw-frame/``sensor_temperature_c`` pairs) with zero residual error
-        across all 9. The humidity half of the packed value has not yet been
-        independently cross-checked against an app-displayed humidity
-        reading the way temperature has, but the packed-value structure
-        (matching the app's own ``ThermometerInfo`` decode) and physically
-        plausible results (60-69% RH) support treating it as correct.
+        across all 9. Humidity is confirmed correct too (2026-09-11,
+        cross-checked live against the app's own displayed humidity %).
+
+        Known limitation, same as the probe-thermometer six-value status
+        frame (see ``GoveeCoordinator._poll_probe_thermometers``): this
+        frame appears to arrive only while a Govee app session is/was
+        recently active against the device, not on any independent timer
+        — observed live going stale (no update at all, no fallback since
+        there is no capability/poll path for either value) after roughly
+        one overnight period with the app closed. No AWS IoT command was
+        found that provokes it on demand. Until/unless one is found, these
+        readings are best-effort and will lag or go stale between app
+        sessions rather than updating continuously.
 
         Args:
             frames: Decoded (not base64) frames from ``op.command``.
