@@ -46,11 +46,6 @@ _SENSOR_HUMIDITY_MQTT_KEYS = (
     "hum",
 )
 
-# See GoveeDeviceState.update_temperature_from_frames for the derivation and
-# caveats — empirically fit, pump-model dehumidifiers (H7152) only.
-_PUMP_DEHUMIDIFIER_TEMP_FRAME_SLOPE_C = 0.025327
-_PUMP_DEHUMIDIFIER_TEMP_FRAME_INTERCEPT_C = 19.6129
-
 
 def _coerce_int(value: Any) -> int | None:
     """int(value), or None when value is empty/None/non-numeric.
@@ -752,28 +747,37 @@ class GoveeDeviceState:
         return False
 
     def update_temperature_from_frames(self, frames: Iterable[bytes]) -> bool:
-        """Apply the live temperature reading a pump-model dehumidifier
-        (H7152) carries in its AWS IoT push — provisional, pending refinement.
+        """Apply the live temperature and humidity readings a pump-model
+        dehumidifier (H7152) carries in its AWS IoT push.
 
-        The H7152 has no ``sensorTemperature`` capability at all (confirmed:
-        absent from the discovered capabilities list even though the app
-        shows a live reading) — the app's temp/humidity/dew-point/pressure
+        The H7152 has no ``sensorTemperature``/``sensorHumidity`` capability
+        at all (confirmed: absent from the discovered capabilities list even
+        though the app shows live readings for both) — the app's ambient
         readout is BLE-adjacent but reachable remotely, so it travels over
         this same AWS IoT push, not local BLE (see the H7150/H7152 section of
         ``docs/govee-protocol-reference.md``).
 
-        Byte offset 4 of the ``aa 10 81 03`` frame in ``op.command`` was
-        found to correlate near-linearly with the app's displayed
-        temperature: least-squares fit over 5 real (app-screenshot +
-        diagnostics) capture pairs on 2026-09-10, spanning 20.9-22.4°C,
-        residuals 2-4 raw counts (~0.05-0.1°C) — small enough to be
-        capture-timing/display-rounding noise rather than a bad fit. NOT
-        validated outside that narrow range and the exact slope/intercept may
-        drift as more real-world data comes in; compare against the app's own
-        temperature history to refine.
+        The ``aa 10 81 03`` frame in ``op.command`` is the app's own BLE
+        status frame (opcode ``0x10`` = ``BleProtocolConstants.P()``, decoded
+        app-side by ``CmdStatusParseV1`` into a ``ThermometerInfo``): bytes
+        3-5 are a single big-endian 3-byte packed value, temperature and
+        humidity each ×10 and concatenated (``temp_decidegrees * 1000 +
+        humidity_decipercent``)::
 
-        Byte offset 5 of the same frame does not correlate with humidity,
-        dew point, or pressure in any of the 5 samples — still unidentified.
+            raw = (frame[3] << 16) | (frame[4] << 8) | frame[5]
+            temperature_c = (raw // 1000) / 10.0
+            humidity_pct = (raw % 1000) / 10.0
+
+        This is an exact decode, not a fit — confirmed against 9 real
+        capture pairs total (5 app-screenshot/diagnostics pairs on
+        2026-09-10 spanning 20.9-22.4°C, superseding this method's earlier
+        best-effort linear regression on byte 4 alone, plus 4 independent
+        raw-frame/``sensor_temperature_c`` pairs) with zero residual error
+        across all 9. The humidity half of the packed value has not yet been
+        independently cross-checked against an app-displayed humidity
+        reading the way temperature has, but the packed-value structure
+        (matching the app's own ``ThermometerInfo`` decode) and physically
+        plausible results (60-69% RH) support treating it as correct.
 
         Args:
             frames: Decoded (not base64) frames from ``op.command``.
@@ -789,9 +793,9 @@ class GoveeDeviceState:
                 and raw[2] == 0x81
                 and raw[3] == 0x03
             ):
-                self.sensor_temperature = round(
-                    _PUMP_DEHUMIDIFIER_TEMP_FRAME_SLOPE_C * raw[4] + _PUMP_DEHUMIDIFIER_TEMP_FRAME_INTERCEPT_C, 1
-                )
+                packed = (raw[3] << 16) | (raw[4] << 8) | raw[5]
+                self.sensor_temperature = round((packed // 1000) / 10.0, 1)
+                self.sensor_humidity = round((packed % 1000) / 10.0, 1)
                 return True
         return False
 

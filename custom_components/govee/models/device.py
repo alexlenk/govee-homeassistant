@@ -688,7 +688,13 @@ class GoveeDevice:
 
     @property
     def supports_humidity_sensor(self) -> bool:
-        """Check if device exposes a sensorHumidity property."""
+        """Check if device exposes a sensorHumidity property, or is a
+        pump-model dehumidifier (H7152) whose AWS IoT push frames carry a
+        reverse-engineered live humidity reading alongside temperature — no
+        capability exists for that one at all, see
+        GoveeDeviceState.update_temperature_from_frames."""
+        if self.sku.upper() in PUMP_DEHUMIDIFIER_SKUS:
+            return True
         return any(
             cap.type == CAPABILITY_PROPERTY and cap.instance == INSTANCE_SENSOR_HUMIDITY
             for cap in self.capabilities

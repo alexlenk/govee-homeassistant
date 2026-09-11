@@ -187,41 +187,10 @@ class TestReconnectPolicy:
         client._create_ssl_context_sync.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_wildcard_subscribe_not_attempted_by_default(self, run_loop):
+    async def test_only_subscribes_to_the_account_topic(self, run_loop):
         sessions = [{"granted": (1,), "drop_error": FakeAiomqtt.MqttError("bye")}]
         _client, fake, _ = await run_loop(sessions, stop_after_sleeps=1)
         fake.clients[0].subscribe.assert_awaited_once_with("GA/account", qos=1)
-
-    @pytest.mark.asyncio
-    async def test_wildcard_subscribe_attempted_after_account_topic_when_enabled(self, run_loop):
-        from unittest.mock import call
-
-        sessions = [{"granted": (1,), "drop_error": FakeAiomqtt.MqttError("bye")}]
-        _client, fake, _ = await run_loop(sessions, stop_after_sleeps=1, attempt_wildcard_subscribe=True)
-        assert fake.clients[0].subscribe.await_args_list == [
-            call("GA/account", qos=1),
-            call("GA/account/#", qos=0),
-        ]
-
-    @pytest.mark.asyncio
-    async def test_refused_wildcard_subscribe_does_not_affect_connected_callback(self, run_loop):
-        """A wildcard SUBACK 0x80 is the expected, informative outcome — the
-        primary session (already confirmed healthy before this runs) must
-        stay up and on_connected must still fire.
-        """
-        connected = MagicMock()
-        sessions = [{"granted": (1,), "drop_error": FakeAiomqtt.MqttError("bye")}]
-        client, fake, _ = await run_loop(
-            sessions, stop_after_sleeps=1, on_connected=connected, attempt_wildcard_subscribe=True
-        )
-        # Both calls share the fixture's single subscribe mock, so both
-        # return the scripted "granted" value (1,) — not a refusal, but this
-        # still proves the wildcard attempt doesn't block reaching connected.
-        # The session then drops per the scripted drop_error (same as
-        # test_connected_callback_fires_after_suback above) — connected
-        # firing at all is what matters here, not the post-drop state.
-        connected.assert_called_once()
-        assert client.last_error is not None and "bye" in client.last_error
 
 
 class TestSubackHelper:

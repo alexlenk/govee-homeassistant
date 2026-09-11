@@ -11,7 +11,6 @@ actual fault).
 """
 
 from __future__ import annotations
-import json
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -31,7 +30,8 @@ FRAME_UNRELATED = bytes.fromhex("aa050003000000000000000000000000000000ac")
 
 # Verbatim ``aa 10 81 03`` frames from 5 real (app-screenshot + diagnostics)
 # capture pairs on 2026-09-10 — see update_temperature_from_frames for the
-# regression this was fit from. Named by their app-displayed temperature.
+# exact packed-value decode these confirm (superseding an earlier best-effort
+# linear fit). Named by their app-displayed temperature.
 FRAME_TEMP_69_6F = bytes.fromhex("aa10810332ce00000000000000000000000000c4")
 FRAME_TEMP_70_7F = bytes.fromhex("aa1081034a370000000000000000000000000045")
 FRAME_TEMP_71_1F = bytes.fromhex("aa10810355ff0000000000000000000000000092")
@@ -141,29 +141,43 @@ class TestUpdateTemperatureFromFrames:
         assert state.update_temperature_from_frames([FRAME_PUMP_OK]) is False
 
     @pytest.mark.parametrize(
-        "frame,expected_celsius",
+        "frame,expected_celsius,expected_humidity",
         [
-            (FRAME_TEMP_69_6F, 20.9),
-            (FRAME_TEMP_70_7F, 21.5),
-            (FRAME_TEMP_71_1F, 21.8),
-            (FRAME_TEMP_72_1F, 22.3),
-            (FRAME_TEMP_72_3F, 22.4),
+            (FRAME_TEMP_69_6F, 20.9, 61.4),
+            (FRAME_TEMP_70_7F, 21.5, 60.7),
+            (FRAME_TEMP_71_1F, 21.8, 62.3),
+            (FRAME_TEMP_72_1F, 22.3, 68.5),
+            (FRAME_TEMP_72_3F, 22.4, 68.8),
         ],
     )
-    def test_decodes_the_fitted_value(self, frame, expected_celsius):
-        """Applies the regression constants to the captured byte — the
-        constants themselves are a best-effort fit (see the method's
-        docstring for the residuals against the real app readings), this
-        just locks in that the arithmetic on a known input doesn't drift."""
+    def test_decodes_the_exact_value(self, frame, expected_celsius, expected_humidity):
+        """Bytes 3-5 are a single big-endian packed value — temperature and
+        humidity each x10 and concatenated, matching the app's own
+        ``CmdStatusParseV1``/``ThermometerInfo`` decode (see the method's
+        docstring). This is an exact decode confirmed against 9 real capture
+        pairs with zero residual error, not a fit — these 5 are the
+        app-screenshot-confirmed temperature pairs; the humidity half of each
+        is the same formula applied to the same verbatim frame."""
         state = GoveeDeviceState.create_empty(DEVICE_ID)
         state.update_temperature_from_frames([frame])
         assert state.sensor_temperature == expected_celsius
+        assert state.sensor_humidity == expected_humidity
 
     def test_picks_the_right_frame_out_of_a_full_push(self):
         state = GoveeDeviceState.create_empty(DEVICE_ID)
         frames = [FRAME_UNRELATED, FRAME_PUMP_OK, FRAME_TEMP_72_3F]
         assert state.update_temperature_from_frames(frames) is True
         assert state.sensor_temperature == 22.4
+        assert state.sensor_humidity == 68.8
+
+
+class TestSupportsHumiditySensorOnPumpDehumidifier:
+    def test_h7152_supports_humidity_sensor(self):
+        assert _h7152().supports_humidity_sensor is True
+
+    def test_h7150_does_not_support_humidity_sensor(self):
+        """No sensorHumidity capability and not confirmed on H7150 frames."""
+        assert _h7150().supports_humidity_sensor is False
 
 
 class TestUpdateDehumidifierModeFromFrames:
@@ -286,436 +300,6 @@ class TestPumpAbnormalPreservedAcrossDeveloperPoll:
         result = await coord._fetch_device_state(DEVICE_ID, coord._devices[DEVICE_ID])
 
         assert result.pump_abnormal is False
-
-
-class TestH7152DebugLog:
-    """TEMPORARY debug-log capture (see coordinator._append_h7152_debug_line).
-
-    Not a permanent feature — remove alongside it once byte 5 (humidity) and
-    the tank-vs-pump-mode signal are both identified.
-    """
-
-    def _coord(self, tmp_path):
-        import custom_components.govee.coordinator as coord_mod
-
-        hass = MagicMock()
-        log_path = tmp_path / "govee_h7152_debug.jsonl"
-        hass.config.path.return_value = str(log_path)
-
-        async def _run_in_executor(fn, *args):
-            return fn(*args)
-
-        hass.async_add_executor_job = AsyncMock(side_effect=_run_in_executor)
-
-        config_entry = MagicMock()
-        config_entry.entry_id = "test_entry"
-        config_entry.async_create_background_task = MagicMock()
-        coord = coord_mod.GoveeCoordinator(
-            hass=hass,
-            config_entry=config_entry,
-            api_client=MagicMock(),
-            iot_credentials=None,
-            poll_interval=60,
-        )
-        return coord, log_path
-
-    @staticmethod
-    def _lines(log_path):
-        if not log_path.exists():
-            return []
-        return [json.loads(line) for line in log_path.read_text().splitlines()]
-
-    @pytest.mark.asyncio
-    async def test_mqtt_push_logs_every_frame_not_just_known_ones(self, tmp_path):
-        """The whole point is catching signals we haven't decoded yet — a
-        pre-filtered log defeats that."""
-        coord, log_path = self._coord(tmp_path)
-        state_data = {
-            "onOff": 1,
-            "sta": {"stc": "19_0_38_43170_1"},
-            "result": 1,
-            "_op_frames": [
-                FRAME_UNRELATED.hex(),
-                FRAME_TEMP_70_7F.hex(),
-                FRAME_PUMP_OK.hex(),
-            ],
-        }
-
-        await coord._log_h7152_debug_frame(state_data, sensor_temperature=21.5, pump_abnormal=False)
-
-        lines = self._lines(log_path)
-        assert len(lines) == 1
-        assert lines[0]["source"] == "mqtt"
-        assert lines[0]["op_frames_hex"] == [
-            FRAME_UNRELATED.hex(),
-            FRAME_TEMP_70_7F.hex(),
-            FRAME_PUMP_OK.hex(),
-        ]
-        assert lines[0]["sta"] == {"stc": "19_0_38_43170_1"}
-        assert lines[0]["sensor_temperature_c"] == 21.5
-        assert lines[0]["pump_abnormal"] is False
-
-    @pytest.mark.asyncio
-    async def test_openapi_event_is_logged_too(self, tmp_path):
-        coord, log_path = self._coord(tmp_path)
-
-        await coord._log_h7152_debug_openapi_event("waterFullEvent", [{"name": "waterFull", "value": 1}])
-
-        lines = self._lines(log_path)
-        assert len(lines) == 1
-        assert lines[0]["source"] == "openapi_event"
-        assert lines[0]["instance"] == "waterFullEvent"
-        assert lines[0]["state"] == [{"name": "waterFull", "value": 1}]
-
-    @pytest.mark.asyncio
-    async def test_stops_appending_past_the_size_cap(self, tmp_path, monkeypatch):
-        import custom_components.govee.coordinator as coord_mod
-
-        monkeypatch.setattr(coord_mod, "_H7152_DEBUG_LOG_MAX_BYTES", 10)
-        coord, log_path = self._coord(tmp_path)
-        log_path.write_text("x" * 20)  # already past the (patched) 10-byte cap
-
-        await coord._append_h7152_debug_line({"source": "mqtt", "ts": "now"})
-
-        assert log_path.read_text() == "x" * 20  # untouched — nothing appended
-
-    @pytest.mark.asyncio
-    async def test_write_failure_does_not_raise(self, tmp_path):
-        """A debug aid must never break real state handling."""
-        coord, _log_path = self._coord(tmp_path)
-        coord.hass.config.path.return_value = str(tmp_path / "no" / "such" / "dir" / "x.jsonl")
-
-        await coord._append_h7152_debug_line({"source": "mqtt", "ts": "now"})  # must not raise
-
-
-class TestH7152RawMessageCapture:
-    """TEMPORARY: _on_mqtt_raw_message covers multiSync/ptReal/anything-else,
-    which never reach _on_mqtt_state_update at all — see that method's
-    docstring for why (humidity/tank-vs-pump-mode might ride one of those
-    instead of a status push, and the log needs to catch it if so).
-    """
-
-    def _coord(self, tmp_path, *, register_h7152=True):
-        import asyncio
-
-        import custom_components.govee.coordinator as coord_mod
-
-        hass = MagicMock()
-        log_path = tmp_path / "govee_h7152_debug.jsonl"
-        hass.config.path.return_value = str(log_path)
-
-        async def _run_in_executor(fn, *args):
-            return fn(*args)
-
-        hass.async_add_executor_job = AsyncMock(side_effect=_run_in_executor)
-
-        scheduled: list[asyncio.Task] = []
-
-        def _create_background_task(_hass, coro, name=None):
-            # Real HA actually runs the coroutine as a task; a bare MagicMock
-            # would leave it uncreated/unawaited, which leaks a "coroutine
-            # was never awaited" warning into a LATER, unrelated test.
-            task = asyncio.ensure_future(coro)
-            scheduled.append(task)
-            return task
-
-        config_entry = MagicMock()
-        config_entry.entry_id = "test_entry"
-        config_entry.async_create_background_task = MagicMock(side_effect=_create_background_task)
-        coord = coord_mod.GoveeCoordinator(
-            hass=hass,
-            config_entry=config_entry,
-            api_client=MagicMock(),
-            iot_credentials=None,
-            poll_interval=60,
-        )
-        if register_h7152:
-            coord._devices[DEVICE_ID] = _h7152()
-        return coord, log_path, scheduled
-
-    @staticmethod
-    def _lines(log_path):
-        if not log_path.exists():
-            return []
-        return [json.loads(line) for line in log_path.read_text().splitlines()]
-
-    def test_status_cmd_is_skipped_here(self, tmp_path):
-        """Already logged, with decoded values, by _on_mqtt_state_update —
-        logging it again here would duplicate every ordinary push."""
-        coord, _log_path, scheduled = self._coord(tmp_path)
-        coord._on_mqtt_raw_message(DEVICE_ID, {"cmd": "status"}, [])
-        assert scheduled == []
-
-    def test_unknown_device_is_skipped(self, tmp_path):
-        coord, _log_path, scheduled = self._coord(tmp_path, register_h7152=False)
-        coord._on_mqtt_raw_message("11:66:C0:EB:1D:75:5C:99", {"cmd": "multiSync"}, [])
-        assert scheduled == []
-
-    def test_non_pump_sku_is_skipped(self, tmp_path):
-        coord, _log_path, scheduled = self._coord(tmp_path, register_h7152=False)
-        coord._devices[DEVICE_ID] = _h7150()
-        coord._on_mqtt_raw_message(DEVICE_ID, {"cmd": "multiSync"}, [])
-        assert scheduled == []
-
-    @pytest.mark.asyncio
-    async def test_multisync_is_scheduled_and_logged(self, tmp_path):
-        coord, log_path, scheduled = self._coord(tmp_path)
-        coord._on_mqtt_raw_message(DEVICE_ID, {"cmd": "multiSync"}, [FRAME_PUMP_OK])
-        assert len(scheduled) == 1
-        await scheduled[0]
-
-        lines = self._lines(log_path)
-        assert len(lines) == 1
-        assert lines[0]["source"] == "mqtt_raw"
-        assert lines[0]["cmd"] == "multiSync"
-
-    @pytest.mark.asyncio
-    async def test_raw_message_write_captures_full_payload(self, tmp_path):
-        coord, log_path, _scheduled = self._coord(tmp_path)
-        data = {
-            "cmd": "multiSync",
-            "type": 0,
-            "sta": {"stc": "19_0_38_43170_1"},
-            "onOff": 1,
-            "result": 1,
-            "state": {"result": 1},
-        }
-
-        await coord._log_h7152_debug_raw_message(data, [FRAME_UNRELATED, FRAME_PUMP_ABNORMAL])
-
-        lines = self._lines(log_path)
-        assert len(lines) == 1
-        assert lines[0]["source"] == "mqtt_raw"
-        assert lines[0]["cmd"] == "multiSync"
-        assert lines[0]["sta"] == {"stc": "19_0_38_43170_1"}
-        assert lines[0]["op_frames_hex"] == [FRAME_UNRELATED.hex(), FRAME_PUMP_ABNORMAL.hex()]
-        assert lines[0]["state"] == {"result": 1}
-
-
-class TestH7152AnyMessageCapture:
-    """TEMPORARY: _on_mqtt_any_message catches every inbound message verbatim,
-    before any parsing/filtering — including a "msg"-wrapped payload that
-    _handle_message's own unwrap-or-drop logic discards before
-    on_raw_message's call site is ever reached (confirmed live: the one
-    ptReal sample seen while the Govee app was open was exactly such a
-    dropped shape). See _on_mqtt_any_message's docstring.
-    """
-
-    def _coord(self, tmp_path, *, register_h7152=True):
-        import asyncio
-
-        import custom_components.govee.coordinator as coord_mod
-
-        hass = MagicMock()
-        log_path = tmp_path / "govee_h7152_debug.jsonl"
-        hass.config.path.return_value = str(log_path)
-
-        async def _run_in_executor(fn, *args):
-            return fn(*args)
-
-        hass.async_add_executor_job = AsyncMock(side_effect=_run_in_executor)
-
-        scheduled: list[asyncio.Task] = []
-
-        def _create_background_task(_hass, coro, name=None):
-            task = asyncio.ensure_future(coro)
-            scheduled.append(task)
-            return task
-
-        config_entry = MagicMock()
-        config_entry.entry_id = "test_entry"
-        config_entry.async_create_background_task = MagicMock(side_effect=_create_background_task)
-        coord = coord_mod.GoveeCoordinator(
-            hass=hass,
-            config_entry=config_entry,
-            api_client=MagicMock(),
-            iot_credentials=None,
-            poll_interval=60,
-        )
-        if register_h7152:
-            coord._devices[DEVICE_ID] = _h7152()
-        return coord, log_path, scheduled
-
-    @staticmethod
-    def _lines(log_path):
-        if not log_path.exists():
-            return []
-        return [json.loads(line) for line in log_path.read_text().splitlines()]
-
-    def test_payload_without_h7152_id_is_skipped(self, tmp_path):
-        coord, _log_path, scheduled = self._coord(tmp_path)
-        coord._on_mqtt_any_message("GD/some/topic", '{"device": "AA:BB:CC:DD:EE:FF:00:11", "cmd": "ptReal"}')
-        assert scheduled == []
-
-    def test_no_h7152_registered_is_skipped(self, tmp_path):
-        coord, _log_path, scheduled = self._coord(tmp_path, register_h7152=False)
-        payload = f'{{"device": "{DEVICE_ID}", "cmd": "ptReal"}}'
-        coord._on_mqtt_any_message("GD/some/topic", payload)
-        assert scheduled == []
-
-    def test_non_pump_sku_is_skipped(self, tmp_path):
-        coord, _log_path, scheduled = self._coord(tmp_path, register_h7152=False)
-        coord._devices[DEVICE_ID] = _h7150()
-        payload = f'{{"device": "{DEVICE_ID}", "cmd": "ptReal"}}'
-        coord._on_mqtt_any_message("GD/some/topic", payload)
-        assert scheduled == []
-
-    @pytest.mark.asyncio
-    async def test_h7152_payload_is_scheduled_and_logged_verbatim(self, tmp_path):
-        coord, log_path, scheduled = self._coord(tmp_path)
-        # A "msg"-wrapped ack lacking a top-level "state" key — exactly the
-        # shape _handle_message's unwrap logic drops before on_raw_message
-        # ever fires. on_any_message must still catch it.
-        payload = (
-            '{"msg": {"cmd": "ptReal", "data": {"command": [], "device": "'
-            + DEVICE_ID
-            + '", "sku": "H7152"}, "cmdVersion": 0, "transaction": "v_123", "type": 1}}'
-        )
-        coord._on_mqtt_any_message("GD/topic/here", payload)
-        assert len(scheduled) == 1
-        await scheduled[0]
-
-        lines = self._lines(log_path)
-        assert len(lines) == 1
-        assert lines[0]["source"] == "mqtt_any"
-        assert lines[0]["topic"] == "GD/topic/here"
-        assert lines[0]["payload"] == payload
-
-    @pytest.mark.asyncio
-    async def test_oversized_payload_is_truncated(self, tmp_path):
-        coord, log_path, scheduled = self._coord(tmp_path)
-        payload = f'{{"device": "{DEVICE_ID}", "filler": "' + ("x" * 9000) + '"}'
-        coord._on_mqtt_any_message("GD/topic", payload)
-        await scheduled[0]
-
-        lines = self._lines(log_path)
-        assert len(lines[0]["payload"]) == 8192
-
-
-class TestStartMqttWildcardSubscribeGating:
-    """TEMPORARY, DISABLED: _start_mqtt hardcodes attempt_wildcard_subscribe
-    to False regardless of H7152 registration — a live install saw MQTT go
-    silent (no debug-log entries, a "dropped early" reconnect warning) right
-    after upgrading to the build that enabled it, consistent with AWS IoT
-    kicking the whole session for the unauthorized wildcard rather than
-    cleanly refusing it. See _start_mqtt's comment for what must be fixed
-    before re-enabling. These tests pin the current disabled state so a
-    future change to the gating logic doesn't silently re-enable it.
-    """
-
-    def _coord(self):
-        import custom_components.govee.coordinator as coord_mod
-
-        hass = MagicMock()
-        config_entry = MagicMock()
-        config_entry.entry_id = "test_entry"
-        coord = coord_mod.GoveeCoordinator(
-            hass=hass,
-            config_entry=config_entry,
-            api_client=MagicMock(),
-            iot_credentials=MagicMock(),
-            poll_interval=60,
-        )
-        return coord, coord_mod
-
-    @pytest.mark.asyncio
-    async def test_disabled_even_when_h7152_registered(self):
-        coord, coord_mod = self._coord()
-        coord._devices[DEVICE_ID] = _h7152()
-
-        fake_client_cls = MagicMock()
-        fake_instance = fake_client_cls.return_value
-        fake_instance.available = False  # short-circuits async_start entirely
-
-        original = coord_mod.GoveeAwsIotClient
-        coord_mod.GoveeAwsIotClient = fake_client_cls
-        try:
-            await coord._start_mqtt()
-        finally:
-            coord_mod.GoveeAwsIotClient = original
-
-        assert fake_client_cls.call_args.kwargs["attempt_wildcard_subscribe"] is False
-
-    @pytest.mark.asyncio
-    async def test_disabled_when_no_h7152_registered(self):
-        coord, coord_mod = self._coord()
-        coord._devices[_h7150().device_id] = _h7150()
-
-        fake_client_cls = MagicMock()
-        fake_instance = fake_client_cls.return_value
-        fake_instance.available = False
-
-        original = coord_mod.GoveeAwsIotClient
-        coord_mod.GoveeAwsIotClient = fake_client_cls
-        try:
-            await coord._start_mqtt()
-        finally:
-            coord_mod.GoveeAwsIotClient = original
-
-        assert fake_client_cls.call_args.kwargs["attempt_wildcard_subscribe"] is False
-
-    @pytest.mark.asyncio
-    async def test_disabled_when_no_devices_at_all(self):
-        coord, coord_mod = self._coord()
-
-        fake_client_cls = MagicMock()
-        fake_instance = fake_client_cls.return_value
-        fake_instance.available = False
-
-        original = coord_mod.GoveeAwsIotClient
-        coord_mod.GoveeAwsIotClient = fake_client_cls
-        try:
-            await coord._start_mqtt()
-        finally:
-            coord_mod.GoveeAwsIotClient = original
-
-        assert fake_client_cls.call_args.kwargs["attempt_wildcard_subscribe"] is False
-
-
-class TestTryWildcardSubscribe:
-    """TEMPORARY: GoveeAwsIotClient._try_wildcard_subscribe must never raise
-    or otherwise affect the already-established primary MQTT session,
-    regardless of the SUBACK outcome — it's a best-effort diagnostic only.
-    """
-
-    def _client(self):
-        import custom_components.govee.api.mqtt as mqtt_mod
-
-        credentials = MagicMock()
-        credentials.account_topic = "GA/account"
-        return mqtt_mod.GoveeAwsIotClient(
-            credentials=credentials,
-            on_state_update=MagicMock(),
-        )
-
-    @pytest.mark.asyncio
-    async def test_granted_does_not_raise(self):
-        client = self._client()
-        fake_aws_client = MagicMock()
-        fake_aws_client.subscribe = AsyncMock(return_value=(0,))
-
-        await client._try_wildcard_subscribe(fake_aws_client)  # must not raise
-
-        # Scoped under the account's own topic — NOT a bare "#", which would
-        # ask for every topic on the whole regional endpoint and tell us
-        # nothing about this account's own policy.
-        fake_aws_client.subscribe.assert_awaited_once_with("GA/account/#", qos=0)
-
-    @pytest.mark.asyncio
-    async def test_refused_does_not_raise(self):
-        client = self._client()
-        fake_aws_client = MagicMock()
-        fake_aws_client.subscribe = AsyncMock(return_value=(0x80,))
-
-        await client._try_wildcard_subscribe(fake_aws_client)  # must not raise
-
-    @pytest.mark.asyncio
-    async def test_exception_does_not_propagate(self):
-        client = self._client()
-        fake_aws_client = MagicMock()
-        fake_aws_client.subscribe = AsyncMock(side_effect=RuntimeError("boom"))
-
-        await client._try_wildcard_subscribe(fake_aws_client)  # must not raise
 
 
 class TestDehumidifierModeSensor:
