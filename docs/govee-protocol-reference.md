@@ -2,12 +2,13 @@
 
 A comprehensive technical reference for Govee device communication protocols, compiled from official documentation, PCAP analysis of the Android app, and community reverse engineering efforts.
 
-**Last Updated:** March 4, 2026
+**Last Updated:** September 11, 2026
 **Data Sources:**
 - `docs/PCAPdroid_24_Jan_16_00_31.pcap` - Android app network capture
 - `logs/PCAPdroid_09_Jan_19_27_26.pcap` - Reference capture
-- Live AWS IoT MQTT capture sessions (January 2026)
-- User-submitted API responses from GitHub issues (February–March 2026)
+- Live AWS IoT MQTT capture sessions (January 2026, September 2026)
+- User-submitted API responses from GitHub issues (February–September 2026)
+- Decompiled Govee Android app (`com.govee.home` v7.6.21-1119, jadx) — AWS IoT topic/subscribe behavior and BLE-over-MQTT sensor frame decoding (September 2026)
 
 ---
 
@@ -684,7 +685,7 @@ def int_to_rgb(color_int):
 
 This protocol provides real-time device state updates and is used by the Govee mobile app for instant synchronization.
 
-### 3.1 Connection Details
+### 4.1 Connection Details
 
 | Parameter | Value |
 |-----------|-------|
@@ -696,7 +697,7 @@ This protocol provides real-time device state updates and is used by the Govee m
 *Endpoint confirmed via PCAP analysis. Multiple IPs observed (load-balanced):*
 *98.88.204.61, 35.169.219.171, 13.223.152.107, 3.231.7.138*
 
-### 3.2 Authentication Flow
+### 4.2 Authentication Flow
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
@@ -721,7 +722,7 @@ This protocol provides real-time device state updates and is used by the Govee m
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-### 3.3 Client ID Format
+### 4.3 Client ID Format
 
 ```
 AP/{accountId}/{clientId}
@@ -729,7 +730,7 @@ AP/{accountId}/{clientId}
 - `accountId`: Numeric account ID from login response (as string)
 - `clientId`: 32-character UUID (generated client-side)
 
-### 3.4 Topic Structure
+### 4.4 Topic Structure
 
 Two topic types are used:
 
@@ -742,7 +743,7 @@ Two topic types are used:
 - Publish commands to device-specific `GD/` topic
 - Device topics obtained from `/device/rest/devices/v1/list` API
 
-### 3.5 Message Formats
+### 4.5 Message Formats
 
 **Incoming State Update (Full Response):**
 
@@ -903,7 +904,7 @@ The `op.command` array contains base64-encoded BLE packets representing device s
 }
 ```
 
-### 3.6 Command Envelope Details
+### 4.6 Command Envelope Details
 
 All MQTT commands follow this envelope:
 ```json
@@ -927,7 +928,7 @@ All MQTT commands follow this envelope:
 | `cmdVersion` | 2 | Status request default |
 | `transaction` | `v_{epoch_ms}000` | Timestamp with 3 trailing zeros |
 
-### 3.7 Command Variants and Fallbacks
+### 4.7 Command Variants and Fallbacks
 
 **Color commands**: Two variants exist:
 - `colorwc` (preferred): `{"color": {"r":N,"g":N,"b":N}, "colorTemInKelvin": N}` — combines RGB and CT
@@ -937,7 +938,7 @@ Some devices only respond to `color`, not `colorwc`. The govee-cloud implementat
 
 **Color temperature**: Similarly `colorwc` with `colorTemInKelvin > 0` vs legacy `colorTem` (percentage-based 0-100).
 
-### 3.8 Device-Specific Quirks
+### 4.8 Device-Specific Quirks
 
 | Device | Quirk |
 |--------|-------|
@@ -945,7 +946,7 @@ Some devices only respond to `color`, not `colorwc`. The govee-cloud implementat
 | H6121 | Needs `cmdVersion: 1` for status requests (not `cmdVersion: 2`) |
 | Some older devices | Only respond to `color` cmd, not `colorwc` |
 
-### 3.9 State Update op Fields
+### 4.9 State Update op Fields
 
 The `op` object in state updates contains base64-encoded BLE packets for device-specific data:
 
@@ -957,11 +958,13 @@ The `op` object in state updates contains base64-encoded BLE packets for device-
 | `wakeupValue` | Wake-up timer data |
 | `timerValue` | Timer schedule data |
 
-### 3.10 Important: Do Not Subscribe to Device Topics
+`op.command` frames themselves are the BLE 20-byte protocol (§7) tunneled over MQTT — decoding one requires the BLE opcode table in §7.4.1, not a separate MQTT-specific format. Combo humidity/temperature sensor SKUs (H7152, H7160, …) pack **both** readings into opcode `0x10`'s payload as a single value; see the H7150/H7152 device-catalog entry in §9.5 for the full decode.
+
+### 4.10 Important: Do Not Subscribe to Device Topics
 
 Subscribing to individual device topics (`GD/...`) causes the AWS IoT server to close the connection. Only subscribe to the account topic (`GA/...`). All state updates for all devices arrive on the account topic.
 
-### 3.11 PCAP Traffic Analysis
+### 4.11 PCAP Traffic Analysis
 
 From PCAP analysis (January 2026 captures):
 
@@ -987,14 +990,14 @@ From PCAP analysis (January 2026 captures):
 
 Used by the Govee mobile app for extended functionality not available in the public API.
 
-### 4.1 Base Configuration
+### 5.1 Base Configuration
 
 | Parameter | Value |
 |-----------|-------|
 | **Base URL** | `https://app2.govee.com` |
 | **User-Agent** | `GoveeHome/7.4.10 (com.ihoment.GoVeeSensor; build:2; iOS 18.4.0) Alamofire/5.10.2` |
 
-### 4.2 Authentication
+### 5.2 Authentication
 
 **Login Request:**
 ```http
@@ -1090,7 +1093,7 @@ timestamp: 1704812400000
 User-Agent: GoveeHome/7.4.10 (com.ihoment.GoVeeSensor; build:2; iOS 18.4.0) Alamofire/5.10.2
 ```
 
-### 4.3 Key Endpoints
+### 5.3 Key Endpoints
 
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
@@ -1103,9 +1106,9 @@ User-Agent: GoveeHome/7.4.10 (com.ihoment.GoVeeSensor; build:2; iOS 18.4.0) Alam
 | `/appsku/v2/devices/scenes/attributes` | GET | Get scene attributes |
 | `/appsku/v1/diys/groups-diys` | GET | Get DIY scenes |
 | `/bff-app/v1/exec-plat/home` | GET | Get One-Click/Tap-to-Run |
-| `/bff-app/v1/device/list` | POST | **Account device list (BFF)** — richest per-device state; see §4.3b |
+| `/bff-app/v1/device/list` | POST | **Account device list (BFF)** — richest per-device state; see §5.3b |
 
-### 4.3b Account Device List (BFF) — `deviceExt` scalar catalog
+### 5.3b Account Device List (BFF) — `deviceExt` scalar catalog
 
 `POST https://app2.govee.com/bff-app/v1/device/list` (constant `GOVEE_BFF_DEVICE_LIST_URL`) returns the account's full device list with a `deviceExt` block per device. This is the **only** source for several values the Developer (API-key) API never exposes, so it requires **email/password** login, not just an API key. Each `deviceExt` sub-object is a JSON **string** under a `_json_str` key that must be re-parsed.
 
@@ -1143,7 +1146,7 @@ data.devices[].deviceExt
 - **No live sensor readings.** The BFF does **not** carry current temp/humidity for dehumidifiers (H7150/H7152) or a real PM2.5 for the H5106 — those are BLE-only in the Govee app (#114, #118).
 - Full field catalog and per-SKU examples: `docs/_research/2026-06-30_30day-issue-sweep.md`.
 
-### 4.4 Scene Library Request
+### 5.4 Scene Library Request
 
 ```http
 GET /appsku/v1/light-effect-libraries?sku=H6072
@@ -1183,7 +1186,7 @@ AppVersion: 7.3.30
 }
 ```
 
-### 4.5 Rate Limits
+### 5.5 Rate Limits
 
 - Login: 30 attempts per 24 hours
 - API calls: Undocumented, but appears generous
@@ -1194,7 +1197,7 @@ AppVersion: 7.3.30
 
 Local network control without cloud dependency. Must be enabled in Govee app device settings.
 
-### 5.1 Network Configuration
+### 6.1 Network Configuration
 
 | Parameter | Value |
 |-----------|-------|
@@ -1204,7 +1207,7 @@ Local network control without cloud dependency. Must be enabled in Govee app dev
 | **Command Port** | 4003 (device listens) |
 | **Protocol** | UDP |
 
-### 5.2 Device Discovery
+### 6.2 Device Discovery
 
 **Scan Request (to 239.255.255.250:4001):**
 ```json
@@ -1257,7 +1260,7 @@ Local network control without cloud dependency. Must be enabled in Govee app dev
 }
 ```
 
-### 5.3 Control Commands (to device-ip:4003)
+### 6.3 Control Commands (to device-ip:4003)
 
 **Power Control:**
 ```json
@@ -1318,7 +1321,7 @@ Local network control without cloud dependency. Must be enabled in Govee app dev
 > Captured addresses are value-scrubbed (MAC→hash, IPv4→`REDACTED_IP`) on top of
 > key-name redaction, since the capture keeps unknown keys (issue #57).
 
-### 5.4 BLE Passthrough (ptReal)
+### 6.4 BLE Passthrough (ptReal)
 
 Send BLE commands through WiFi for devices supporting it:
 
@@ -1333,7 +1336,7 @@ Send BLE commands through WiFi for devices supporting it:
 }
 ```
 
-### 5.5 Supported Devices
+### 6.5 Supported Devices
 
 Devices with confirmed LAN API support:
 - H619Z, H6072, H619C, H7060, H619B
@@ -1343,7 +1346,7 @@ Devices with confirmed LAN API support:
 - H6144, H615A, H6056, H6143, H6076
 - H6062, H6061, and more
 
-### 5.6 Python Implementation
+### 6.6 Python Implementation
 
 ```python
 import socket
@@ -1404,7 +1407,7 @@ for d in devices:
 
 Direct Bluetooth Low Energy control for devices without WiFi or for local-only operation.
 
-### 6.1 Service Configuration
+### 7.1 Service Configuration
 
 | Parameter | Value |
 |-----------|-------|
@@ -1416,7 +1419,7 @@ Direct Bluetooth Low Energy control for devices without WiFi or for local-only o
 > **Note:** The write characteristic UUID differs between models (`0x2b10` vs `0x2b11`).
 > No BLE authentication is required — any device can send commands.
 
-### 6.2 Packet Structure
+### 7.2 Packet Structure
 
 All commands are **20 bytes** with XOR checksum:
 
@@ -1426,7 +1429,7 @@ All commands are **20 bytes** with XOR checksum:
 └──────────┴─────────┴──────────┴──────────────────┴──────────┘
 ```
 
-### 6.3 Identifier Bytes
+### 7.3 Identifier Bytes
 
 | Byte | Purpose |
 |------|---------|
@@ -1435,14 +1438,14 @@ All commands are **20 bytes** with XOR checksum:
 | `0xA1` | DIY mode data |
 | `0xA3` | Multi-packet/scene data |
 
-### 6.3b Keep-Alive
+### 7.3b Keep-Alive
 
 Sent every 2 seconds to maintain BLE connection:
 ```
 AA 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 AB
 ```
 
-### 6.4 Command Types (0x33 prefix)
+### 7.4 Command Types (0x33 prefix)
 
 | Command | Byte | Description |
 |---------|------|-------------|
@@ -1492,7 +1495,7 @@ Attempted remote activation via MQTT `ptReal` commands:
 It requires the physical power cycling trigger (OFF→ON within 2 seconds). The device
 firmware appears to only accept this mode change from local state transitions.
 
-### 6.4.1 Status Packet Types (0xAA prefix, in MQTT responses)
+### 7.4.1 Status Packet Types (0xAA prefix, in MQTT responses)
 
 *Discovered via live MQTT capture (January 2026):*
 
@@ -1507,7 +1510,7 @@ firmware appears to only accept this mode change from local state transitions.
 | `0x26` | Status flags | General status |
 | `0xA5` | Segment colors | 4 RGB triplets per packet |
 
-### 6.4.2 Multi-Packet Types (0xA3 prefix)
+### 7.4.2 Multi-Packet Types (0xA3 prefix)
 
 | Sub-byte | Purpose |
 |----------|---------|
@@ -1515,7 +1518,7 @@ firmware appears to only accept this mode change from local state transitions.
 | `0x0A` | Scene parameter |
 | `0x58` | Scene selection |
 
-### 6.4.3 Segment Color Encoding (0xAA 0xA5)
+### 7.4.3 Segment Color Encoding (0xAA 0xA5)
 
 RGBIC devices report segment colors in `op.command` array:
 
@@ -1532,7 +1535,7 @@ aaa50114ffd66427ffd66427ffd66414ffd6640e  → Seg 0-3: RGB(20,255,214), RGB(100,
 aaa50214ffd66414ffd66427ffd6640000000067  → Seg 4-6: RGB(20,255,214), RGB(100,20,255), ...
 ```
 
-### 6.5 Checksum Calculation
+### 7.5 Checksum Calculation
 
 ```python
 def calculate_checksum(data: list[int]) -> int:
@@ -1551,7 +1554,7 @@ def build_packet(data: list[int]) -> bytes:
     return bytes(packet)
 ```
 
-### 6.6 Command Examples
+### 7.6 Command Examples
 
 **Power On:**
 ```
@@ -1578,7 +1581,7 @@ def build_packet(data: list[int]) -> bytes:
 33 14 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 26
 ```
 
-### 6.7 Color Mode Bytes (after 0x05)
+### 7.7 Color Mode Bytes (after 0x05)
 
 | Byte | Mode |
 |------|------|
@@ -1589,7 +1592,7 @@ def build_packet(data: list[int]) -> bytes:
 | `0x0A` | DIY mode |
 | `0x0B` | Segment color |
 
-### 6.8 Scene Activation
+### 7.8 Scene Activation
 
 ```
 33 05 04 [SceneCode_Low] [SceneCode_High] 00...00 [XOR]
@@ -1599,14 +1602,14 @@ Scene codes from the scene library API are split little-endian:
 - Scene code 10191 = 0x27CF
 - Packet: `33 05 04 CF 27 00...00 [XOR]`
 
-### 6.9 Keep-Alive
+### 7.9 Keep-Alive
 
 Send every 2 seconds to maintain connection:
 ```
 AA 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 AB
 ```
 
-### 6.10 Python Implementation
+### 7.10 Python Implementation
 
 ```python
 import asyncio
@@ -1647,7 +1650,7 @@ async def control_light(address: str):
 asyncio.run(control_light("AA:BB:CC:DD:EE:FF"))
 ```
 
-### 6.7 Cross-Protocol Relationship
+### 7.11 Cross-Protocol Relationship
 
 The BLE 20-byte packet format is the canonical low-level protocol. MQTT and LAN tunnel these packets via `ptReal` commands for anything beyond basic operations:
 
@@ -1663,7 +1666,7 @@ The BLE 20-byte packet format is the canonical low-level protocol. MQTT and LAN 
 
 `ptReal` commands wrap base64-encoded BLE packets, making BLE the universal escape hatch for features not supported by the high-level JSON commands.
 
-### 6.8 Probe Thermometers (H5192)
+### 7.12 Probe Thermometers (H5192)
 
 Two-probe cooking thermometers use the same 20-byte packet format as the light
 strips, but with their own registers and — unlike every other device in this
@@ -1774,7 +1777,7 @@ Same as the rest of the BLE protocol: byte 19 is the XOR of bytes 0 through 18.
 
 ## 8. State Management
 
-### 7.1 State Sources
+### 8.1 State Sources
 
 | Source | Update Method | Latency | Completeness |
 |--------|--------------|---------|--------------|
@@ -1784,7 +1787,7 @@ Same as the rest of the BLE protocol: byte 19 is the XOR of bytes 0 through 18.
 | LAN Status | UDP request | <10ms | Basic state |
 | Optimistic | Assumed | 0ms | Command only |
 
-### 7.2 State Fields
+### 8.2 State Fields
 
 ```typescript
 interface DeviceState {
@@ -1818,7 +1821,7 @@ interface DeviceState {
 }
 ```
 
-### 7.3 Optimistic Updates
+### 8.3 Optimistic Updates
 
 After sending a command, update local state immediately:
 
@@ -1842,7 +1845,7 @@ class StateManager:
         # On confirmation, merge to confirmed_state
 ```
 
-### 7.4 Conflict Resolution
+### 8.4 Conflict Resolution
 
 When optimistic state conflicts with confirmed state:
 
@@ -1850,7 +1853,7 @@ When optimistic state conflicts with confirmed state:
 2. **Source priority**: MQTT > API Poll > Optimistic
 3. **Attribute-specific**: Only update changed attributes
 
-### 7.5 Known Limitations
+### 8.5 Known Limitations
 
 These states are NOT returned by the API:
 - Active music mode settings
@@ -1866,13 +1869,13 @@ Thermometer / sensor reading behavior (confirmed in issue #83 from v2026.5.13 + 
   - BLE sensors via an H5151 gateway (H5075, H5110): gateway batch-uploads infrequently — often many minutes (observed ~15–60 min; not a fixed constant).
   - For real-time (~2 s) readings, use HA's first-party `govee_ble` integration or an ESPHome Bluetooth proxy — the cloud path cannot beat this.
 - **Offline devices return empty strings.** Govee's cloud returns `""` (not `null`/`0`) for capability values when a device is offline; numeric parsers must tolerate `""` (an unguarded `int("")` raised `ValueError` and aborted the whole device fetch — fixed v2026.5.15). Independently reproduced in govee2mqtt [#308](https://github.com/wez/govee2mqtt/issues/308) (`sensorTemperature` → `"value": ""`).
-- **Fahrenheit returned without a unit field.** Govee's API returns the reading in the device's app-configured unit (often °F) with no unit metadata; the consumer must convert. Same behavior seen in govee2mqtt [#206](https://github.com/wez/govee2mqtt/issues/206). See the thermometer profiles in §8.5 for the `api_temperature_unit` option.
+- **Fahrenheit returned without a unit field.** Govee's API returns the reading in the device's app-configured unit (often °F) with no unit metadata; the consumer must convert. Same behavior seen in govee2mqtt [#206](https://github.com/wez/govee2mqtt/issues/206). See the thermometer profiles in §9.5 for the `api_temperature_unit` option.
 
 ---
 
 ## 9. Device Capabilities
 
-### 8.1 Capability Types
+### 9.1 Capability Types
 
 | Type | Description |
 |------|-------------|
@@ -1892,7 +1895,7 @@ Thermometer / sensor reading behavior (confirmed in issue #83 from v2026.5.13 + 
 | `devices.capabilities.online` | Online status |
 | `devices.capabilities.event` | Real-time events (water full, ice full, lack water, leak detection) |
 
-### 8.2 Instance Names
+### 9.2 Instance Names
 
 | Capability | Instances |
 |------------|-----------|
@@ -1910,7 +1913,7 @@ Thermometer / sensor reading behavior (confirmed in issue #83 from v2026.5.13 + 
 | property | `sensorTemperature`, `sensorHumidity`, `carbonDioxideConcentration`, `filterLifetime`, `airQuality` |
 | event | `lackWaterEvent`, `iceFullEvent`, `waterFullEvent`, `bodyAppearedEvent` (leak sensors) |
 
-### 8.3 Device Type Detection
+### 9.3 Device Type Detection
 
 ```python
 def detect_capabilities(device_response):
@@ -1949,7 +1952,7 @@ def detect_capabilities(device_response):
     return features
 ```
 
-### 8.4 Device Types
+### 9.4 Device Types
 
 | Type | Examples |
 |------|----------|
@@ -1965,7 +1968,7 @@ def detect_capabilities(device_response):
 | `devices.types.air_quality_monitor` | CO2/air quality monitors (H5140) |
 | `devices.types.sensor` | Motion, presence, water-leak sensors (H5059) |
 
-### 8.5 Known Device Capability Profiles
+### 9.5 Known Device Capability Profiles
 
 Real API responses collected from user reports and testing.
 
@@ -2626,7 +2629,7 @@ The H5127 presence sensor **reuses the same `bodyAppearedEvent` event capability
 ```
 
 - **Detection must be SKU-locked**, not shape-based. The H5054/H5059 leak sensors advertise the *same* `{1, 2}` option values (leak uses `alarmType: 1` with LEAKED(1)/UN_LEAKED(2), see H5059 above). Keying presence-vs-leak on the option shape mis-classified real H5054s as presence sensors and stripped their Water Leak entity (regression in v2026.6.24 → fixed v2026.6.25 by locking to `PRESENCE_SENSOR_SKUS = {"H5127"}`). `alarmType` (50 vs 1) is a secondary discriminator but not every leak SKU's `alarmType` is catalogued, so SKU is authoritative.
-- **Live presence is MQTT-only.** The `/device/state` poll returns only `online`; present/absent arrives as `state.triSta` (`1`/`0`) in the `cmd: "status"` push — see §3.5. Maps to a `binary_sensor` device_class `occupancy`.
+- **Live presence is MQTT-only.** The `/device/state` poll returns only `online`; present/absent arrives as `state.triSta` (`1`/`0`) in the `cmd: "status"` push — see §4.5. Maps to a `binary_sensor` device_class `occupancy`.
 - BFF census: direct-WiFi device (`in_leak_sensor_skus=false`, `in_leak_hub_skus=false`, `has_sno=false`, `has_gateway_info=false`) — no hub, no LoRa.
 
 #### H5106 — Air Quality Monitor (`devices.types.thermometer`)
@@ -2665,8 +2668,8 @@ Reports `devices.types.thermometer` (not `air_quality_monitor` like the H5140). 
 
 - **Target humidity lives in the Auto-mode `modeValue`.** `workMode` is a STRUCT `{workMode ENUM, modeValue}`. gearMode `modeValue` is the fan gear (Low 1 / Medium 2 / High 3 — the **H7150 omits Medium**). The humidity setpoint is the Auto `modeValue`, but its advertised range is **model-dependent**: the **H7150** allows a settable `30–80`, while the **H7151/H7152 pin Auto to a fixed `80` (range `min:80, max:80`)**. Either way the `/device/state` poll returns `modeValue: 0` for Auto — Govee doesn't populate the current Auto setpoint — so `configured_humidity` reads null/0 (reporter #118 on an H7150 saw `workMode 3 / modeValue 0`). This exact "Auto → modeValue 0, HA number expects 80" mismatch is independently reproduced in govee2mqtt #413.
 - **`waterFullEvent` is a push-only event** (`alarmType 58`, `eventState.options[].value 1` = "Water bucket is full or has been pulled out"). It is absent from the `/device/state` poll and not pushed over MQTT, so tank-full state is read from **BFF `deviceSettings.waterFull`** (`1` = full) → `binary_sensor` device_class `problem`. Requires email/password (#118).
-- The `range`/`humidity` `state.value` comes back as an **empty string `""`** in the poll, and there is **no `sensorTemperature` / `sensorHumidity` capability at all** on these dehumidifiers — confirmed in govee2mqtt #413 too. The Govee app shows live temp/humidity/dew-point/pressure regardless, and remotely (off local network, ruling out a direct BLE-only read) — they arrive over the AWS IoT MQTT push's `op.command` BLE-format frames the same way `pumpAbnormal` below does. See the per-frame breakdown below for what's decoded and what's still open.
-- **H7152 `op.command` frame map — reverse-engineered on a real device, 2026-09-10, issue #114 follow-up.** A normal `status` push carries ~15 fixed-position frames; three are decoded, one confirmed still-unidentified. All findings below are SKU-locked to **H7152** (`PUMP_DEHUMIDIFIER_SKUS`) — H7150/H7151 are non-pump variants with no confirmed frame layout of their own.
+- The `range`/`humidity` `state.value` comes back as an **empty string `""`** in the poll, and there is **no `sensorTemperature` / `sensorHumidity` capability at all** on these dehumidifiers — confirmed in govee2mqtt #413 too. The Govee app shows live temp/humidity/dew-point/pressure regardless, and remotely (off local network, ruling out a direct BLE-only read) — they arrive over the AWS IoT MQTT push's `op.command` BLE-format frames the same way `pumpAbnormal` below does. See the per-frame breakdown below: temperature, live humidity and the pump fault flag are now decoded; dew-point/pressure (both app-computed from temp+humidity, not independent readings) and tank-vs-hose mode are still open.
+- **H7152 `op.command` frame map — reverse-engineered on a real device, 2026-09-10/11, issue #114 follow-up.** A normal `status` push carries ~15 fixed-position frames; all four fields of interest (pump fault, temperature, **live humidity**, target-humidity setpoint) are now decoded. All findings below are SKU-locked to **H7152** (`PUMP_DEHUMIDIFIER_SKUS`) — H7150/H7151 are non-pump variants with no confirmed frame layout of their own.
 
   - **Pump fault (`aa 17` frame), byte offset 12** — `0x00` normal, `0x01` while "Pump Abnormality" is showing in the app:
     ```
@@ -2674,12 +2677,35 @@ Reports `devices.types.thermometer` (not `air_quality_monitor` like the H5140). 
     pump abnormal:   aa 17 00 00 00 00 00 00 00 00 00 00 [01] 00 00 00 00 00 00 bc
     ```
     Not a capability (absent from the discovered capabilities list even while active), not on the OpenAPI event channel, not in the flat MQTT `state` keys — all confirmed empty during a live fault. A **live/level flag**, not edge-latched like `waterFullEvent`: clears on its own, no "Clear Alert" button needed. Confirmed against 3 lab captures (before/during×2/after) plus 2 independent real-world faults caught by the shipped sensor, one of which lined up with Home Assistant's own recorded state-transition timestamp to the second. (An earlier pass misread this as offset 11 — eyeballing a hex dump by hand; only caught once a real `pytest` run diffed the two captured frames byte-for-byte. Decode candidate offsets programmatically, not by eye.)
-  - **Temperature (`aa 10 81 03` frame), byte offset 4** — near-linear, `°C ≈ 0.025327 × byte + 19.6129`. Least-squares fit over 5 paired app-screenshot + diagnostics captures spanning 20.9–22.4°C; residuals 2–4 raw counts. Loosely re-validated against a further ~20 unpaired debug-log samples spanning 22.2–23.0°C with no formula change needed, but still provisional — compare against the app's own temperature history for a fuller check before trusting it far outside the fitted range.
-    - **Byte offset 5 of the same frame is still unidentified — and is very likely not humidity.** Does not correlate with humidity, dew point, or pressure in any sample collected so far (11+ paired points). One extremely-short-interval pair suggested a "+1 per minute" counter, but that didn't hold up against longer gaps — likely coincidence, not a real pattern. A systematic per-byte diff across a later, wider capture (27 unpaired debug-log samples, ~2h span, full 20-byte width, all 14 other frame types in the push) confirms byte 5 is the *only* remaining unexplained moving byte anywhere in the `status` push — but its own behavior rules it out as a physical humidity reading: across two pushes only **3 seconds apart**, byte 5 swung by 23 raw counts (91 → 114) while byte 4 (temperature) barely moved — a swing no real indoor humidity sensor can produce in 3 seconds. In other windows it instead drifted smoothly by only a handful of counts over 15+ minutes with temperature pinned constant, so its behavior is inconsistent, not just unexplained. Best working theory: byte 5 is fine-grained jitter/noise on the same temperature ADC read (not an independent sensor channel), possibly a race between the register latch and read during rapid successive reports. Whatever encodes live humidity has NOT been found anywhere in the `status`/`multiSync` push's frame set — every other frame across all samples analyzed is either constant or fully accounted for by the pump/temperature/setpoint findings above.
+  - **Temperature + live humidity (`aa 10 81 03` frame), byte offsets 3–5 — RESOLVED 2026-09-11, supersedes the "byte 5 is noise, humidity absent" conclusion below.** Bytes 3, 4 and 5 are not three independent fields — they are one **24-bit big-endian packed integer** (`0x03xxyy`, byte 3 is `0x03` across the whole room-temperature range captured so far, which is why earlier passes folded it into the frame's fixed "identifier" prefix instead of treating it as data). Decoded straight from the official Govee Android app (v7.6.21, decompiled): `com.govee.base_h71xx.sku_base.adjust.component.bean.ThermometerInfo.Companion` (functions `a()`/`b()`/`c()`) is the shared decoder every WiFi combo sensor SKU uses, invoked for this exact opcode by `com.govee.h7160.iot.CmdStatusParseV1` (`BleProtocolConstants.P() == 0x10`) — the H7160 humidifier ships the identical `aa 10` frame and calls the identical shared class, confirming this is a cross-SKU format, not H7160-specific:
 
-      **`ptReal` while the app was actively open — tried, came back empty. Confirmed against the untouched wire bytes, not just our own decode.** First pass logged only the fields our own parser extracts (`state`, decoded `op.command` frames), which left one legitimate worry: if a real response used a JSON shape our parser doesn't recognise (e.g. payload nested under `"data"` instead of `"state"`, matching our own outgoing command envelope), it could be silently dropped by `_handle_message`'s unwrap-or-return branch before ever reaching the debug log — a genuine blind spot, not a hypothetical one (see the `on_any_message` hook added to close it, next section). A second, longer capture (~15 minutes, app open and switching screens/changing the target-humidity slider throughout) logged the **complete, untouched JSON text of every message**, bypassing that parser entirely. Result: every `status` push's `op.command` array — decoded from the raw base64, independently re-verified byte-for-byte against our own hex output — contains exactly the same 15 frames every time, no more, no less; the one `ptReal` message seen has a literal `"op": {}` and `"state": {"result": 1}` in the raw JSON — genuinely, provably empty, not an artifact of our decoding. This is no longer an inference: live humidity is **not present anywhere in the account-topic AWS IoT MQTT traffic** for this device, full stop.
+    ```python
+    raw = (frame[3] << 16) | (frame[4] << 8) | frame[5]   # signed 24-bit, sign bit = bit 23
+    magnitude = raw & 0x7FFFFF
+    temperature_c = (magnitude // 1000) / 10.0   # + per-SKU calibration offset, if any
+    humidity_pct  = (magnitude %  1000) / 10.0   # + per-SKU calibration offset, if any
+    ```
 
-      That said, this integration only ever subscribes to **one** MQTT topic — the account-wide `GA/<accountId>` topic (`GoveeAwsIotClient.async_start`, the single `client.subscribe(account_topic, ...)` call). If Govee's backend also publishes device state to a *different* topic — most plausibly a standard **AWS IoT device shadow** (`$aws/things/<thing-name>/shadow/...`), a common pattern for "current full device state" that's architecturally distinct from the event-stream topic this integration listens to — humidity could live there and we would never see it regardless of how thorough the capture on the account topic is. That's a real, concrete explanation for "temperature but not humidity" that isn't just an app-side special case: two different pieces of state riding two different topics on the same account is exactly how AWS IoT is normally used.
+    **Validated against 4 live H7152 pushes** (account topic `GA/…`, captured 2026-09-11) — every decoded temperature reproduces this doc's own previously-fitted regression exactly, and the humidity that regression missed falls out of the same bytes for free:
+
+    | `frame[3:6]` | `raw` | temperature (matches the prior fit) | **humidity (new)** |
+    |---|---|---|---|
+    | `03 88 89` | 231561 | 23.1 °C | **56.1 %** |
+    | `03 75 09` | 226825 | 22.6 °C | **82.5 %** |
+    | `03 75 0a` | 226826 | 22.6 °C | **82.6 %** |
+    | `03 7c cd` | 228557 | 22.8 °C | **55.7 %** |
+
+    This also explains the earlier byte-5-only analysis below rather than contradicting it: treating byte 5 in isolation, its contribution to `magnitude % 1000` is not linear in byte 5 alone (it also depends on byte 4 via the shared modulo), so two pushes 3 seconds apart with byte 4 unchanged can show a large byte-5 swing that is real humidity movement, not sensor noise — a plausible reading in a device that is actively pulling moisture out of the air it's measuring. The historical analysis is left in place below for the record; treat its "not humidity" verdict as superseded by the above, not as a second opinion to weigh against it.
+
+    **Superseded analysis, kept for the record (byte 4 / byte 5 were treated as independent fields):** Near-linear, `°C ≈ 0.025327 × byte4 + 19.6129`. Least-squares fit over 5 paired app-screenshot + diagnostics captures spanning 20.9–22.4°C; residuals 2–4 raw counts — those residuals are now explained: they're byte 5's real contribution to the combined 24-bit value, which this fit could only see as scatter.
+
+    **Byte offset 5 of the same frame is still unidentified — and is very likely not humidity.** Does not correlate with humidity, dew point, or pressure in any sample collected so far (11+ paired points). One extremely-short-interval pair suggested a "+1 per minute" counter, but that didn't hold up against longer gaps — likely coincidence, not a real pattern. A systematic per-byte diff across a later, wider capture (27 unpaired debug-log samples, ~2h span, full 20-byte width, all 14 other frame types in the push) confirms byte 5 is the *only* remaining unexplained moving byte anywhere in the `status` push — but its own behavior rules it out as a physical humidity reading: across two pushes only **3 seconds apart**, byte 5 swung by 23 raw counts (91 → 114) while byte 4 (temperature) barely moved — a swing no real indoor humidity sensor can produce in 3 seconds. In other windows it instead drifted smoothly by only a handful of counts over 15+ minutes with temperature pinned constant, so its behavior is inconsistent, not just unexplained. Best working theory: byte 5 is fine-grained jitter/noise on the same temperature ADC read (not an independent sensor channel), possibly a race between the register latch and read during rapid successive reports. Whatever encodes live humidity has NOT been found anywhere in the `status`/`multiSync` push's frame set — every other frame across all samples analyzed is either constant or fully accounted for by the pump/temperature/setpoint findings above.
+
+    **`ptReal` while the app was actively open — tried, came back empty.** Every `status` push's `op.command` array contains exactly the same 15 frames every time, no more, no less; the one `ptReal` message seen has a literal `"op": {}` and `"state": {"result": 1}` — this part of the finding stands: `ptReal` genuinely returns nothing extra. What was wrong was the conclusion drawn from it (that humidity must therefore be entirely absent) — it was already present in the `status` push's own `aa 10` frame, just not decoded yet.
+
+    That said, this integration only ever subscribes to **one** MQTT topic — the account-wide `GA/<accountId>` topic (`GoveeAwsIotClient.async_start`, the single `client.subscribe(account_topic, ...)` call). The AWS device-shadow theory below is now moot for humidity specifically (it was on the account topic all along), but the underlying fact — this integration deliberately subscribes to nothing beyond the account topic — remains correct and is unrelated to this correction; see the wildcard-subscribe finding just below, which still stands.
+
+    If Govee's backend also publishes device state to a *different* topic — most plausibly a standard **AWS IoT device shadow** (`$aws/things/<thing-name>/shadow/...`), a common pattern for "current full device state" that's architecturally distinct from the event-stream topic this integration listens to — some other field could still live there. That remains unconfirmed either way and is now irrelevant to humidity, which did not require it.
 
       **Wildcard-subscribe diagnostic — implemented, then DISABLED; the disconnect theory is now confirmed against AWS's own documentation, not just inferred.** `GoveeAwsIotClient` could optionally subscribe to `<account_topic>/#` (e.g. `GA/<accountId>/#`) right after the account topic was confirmed up (`_try_wildcard_subscribe`), purely to see what AWS IoT's per-certificate SUBACK said — deliberately scoped under the account's own topic rather than a bare `#`. `_start_mqtt` originally opted an account in whenever an H7152 was registered; on the one real-world test, the H7152 debug log went silent and HA logged `AWS IoT connection dropped early (MqttError: Disconnected during message iteration)` shortly after upgrading to the build that enabled it.
 
@@ -2702,9 +2728,9 @@ Reports `devices.types.thermometer` (not `air_quality_monitor` like the H5140). 
                     client.subscribe(topic, mosquitto_rs::QoS::AtMostOnce).await...
     ```
     That's independent, prior confirmation of exactly the failure mode this integration hit: subscribing to *any* topic beyond the account topic — even an exact, known, already-in-use device topic, not a wildcard — gets the whole session closed by the server. `homebridge-govee`'s own documentation is equally direct: *"You only need to subscribe to the topic provided in the authentication response, all device states are published here."* Both projects only ever subscribe to the one account topic. This settles the "maybe a second topic carries humidity" question: there isn't a second topic reachable this way, full stop — not just for this integration, but per the two other actively-maintained community implementations of this same undocumented protocol.
-  - **govee2mqtt's own BLE frame decoder confirms the same absence, for every SKU it supports, not just the H7152.** Its `PacketCodec` registry (`src/ble.rs`) only ever decodes a **target/setpoint** humidity frame — `0xaa 0x05 0x03` for the `H7160` humidifier, the *same opcode* this investigation independently found for the H7152's target-humidity setpoint — never a live/current-humidity reading. No `GoveeBlePacket` variant for any SKU decodes a current humidity value from an AWS IoT frame anywhere in that project. Their own `sensorHumidity` sensor (`src/hass_mqtt/sensor.rs`) reads the REST/Platform API capability value instead — the same channel this integration's docs already note returns an empty string for the H7150/H7151/H7152 family. Between this integration's own exhaustive per-byte capture and govee2mqtt's independently-built decoder for the wider Govee device lineup, there is no remaining candidate: live humidity is not transmitted over AWS IoT for any Govee device either project has examined, dehumidifier or humidifier.
+  - **govee2mqtt's own BLE frame decoder — corrected reading, 2026-09-11.** Its `PacketCodec` registry (`src/ble.rs`) decodes a **target/setpoint** humidity frame — `0xaa 0x05 0x03` for the `H7160` humidifier, the *same opcode* this investigation independently found for the H7152's target-humidity setpoint. The earlier note here concluded from this that live humidity is absent from AWS IoT entirely; that conclusion was wrong. govee2mqtt's decoder for `0xaa 0x10` (its `H7160`/thermometer packet type) was never checked closely enough by this investigation to notice it packs *both* temperature and humidity into one field — the official Govee Android app's own source (`ThermometerInfo`, see above) confirms `0xaa 0x10` carries both, using the same 3-byte-packed-integer format on every WiFi combo-sensor SKU it supports, H7152 included. govee2mqtt's own `sensorHumidity` HA sensor (`src/hass_mqtt/sensor.rs`) does read the REST/Platform API capability value rather than this MQTT frame — that part is accurate — but that's a choice, not evidence the MQTT field doesn't exist. This integration's own capture (four live H7152 samples, table above) independently confirms the field is present and decodes correctly without needing to rely on govee2mqtt's implementation either way.
   - **Pump fault, reconfirmed live (2026-09-10):** during this same wider capture the fault flag went `true` from 19:07:19 to ~19:11:37 UTC, matching a real "Pump Alarm" shown in the app at the same time — independent confirmation beyond the original lab captures.
-  - All of the above was captured via a **TEMPORARY debug log** (`govee_h7152_debug.jsonl` in the HA config dir, see `GoveeCoordinator._append_h7152_debug_line`) added specifically for this investigation. Remove it once humidity and tank-mode are both confirmed.
+  - All of the above was captured via a **TEMPORARY debug log** (`govee_h7152_debug.jsonl` in the HA config dir, see `GoveeCoordinator._append_h7152_debug_line`) added specifically for this investigation. Temperature and humidity are now both confirmed and decoded (see above) — leave the debug log in place until tank-mode (hose vs. bucket) is also confirmed, then remove it.
 - Cross-validated 2026-06-30 against the **goveelife** real-device fixtures (`h7150_2024-08-12.json`, `h7151_2025-06-01.json`) and **govee2mqtt** issues #413 / #145 — see `docs/_research/2026-06-30_30day-issue-sweep.md`.
 
 #### H5310 — Smart Thermometer P2 / Pool Thermometer (`devices.types.thermometer`, gateway-bridged)
@@ -2777,7 +2803,7 @@ Key observations for sensor devices:
 - `event` instances carry no pollable state — react to the pushed event / `eventState.options` enum
 - Some sensor-only SKUs (H5054) are absent from the Developer API and need the account API
 
-### 8.7 Appliance Capability Patterns
+### 9.6 Appliance Capability Patterns
 
 Non-light devices follow consistent patterns:
 
@@ -2787,7 +2813,7 @@ Non-light devices follow consistent patterns:
 | **Sensor-only** | `property` instances only (read-only) | Thermometers, CO2 monitors |
 | **Nightlight sub-pattern** | `nightlightToggle` + `brightness` + `colorRgb` + `nightlightScene` | H7120, H7124, H7140 (embedded in appliance) |
 
-### 8.8 DreamView vs Camera-based Video Sync
+### 9.7 DreamView vs Camera-based Video Sync
 
 | Feature | DreamView (HDMI) | Camera Video Sync |
 |---------|-----------------|-------------------|
@@ -2800,7 +2826,7 @@ Devices with hardware HDMI passthrough expose `dreamViewToggle` via the cloud AP
 
 ---
 
-### 9.7 Models from submitted diagnostics (2026-03 → 2026-09)
+### 9.8 Models from submitted diagnostics (2026-03 → 2026-09)
 
 Capability lists below are as the Developer API `/user/devices` returned them in diagnostics attached to the referenced issues (parameters abbreviated to options, ranges and segment sizes; `dataType`/`required` dropped). Readback notes are from the same captures' `/device/state`. Models already covered above are not repeated; the full per-model table including account-list data is in [`device-catalog.md`](device-catalog.md).
 
@@ -4375,7 +4401,7 @@ Capability lists below are as the Developer API `/user/devices` returned them in
 
 ## 10. Scene & DIY Modes
 
-### 9.1 Scene Types
+### 10.1 Scene Types
 
 | Type | Source | Description |
 |------|--------|-------------|
@@ -4383,7 +4409,7 @@ Capability lists below are as the Developer API `/user/devices` returned them in
 | **DIY Scenes** | Official API | User-created via app |
 | **Light Effect Library** | app2 API | Full scene catalog |
 
-### 9.2 Fetching Scenes (Official API)
+### 10.2 Fetching Scenes (Official API)
 
 ```http
 POST /router/api/v1/device/scenes
@@ -4397,7 +4423,7 @@ POST /router/api/v1/device/scenes
 }
 ```
 
-### 9.3 Fetching Full Scene Catalog (Undocumented)
+### 10.3 Fetching Full Scene Catalog (Undocumented)
 
 ```http
 GET https://app2.govee.com/appsku/v1/light-effect-libraries?sku=H6072
@@ -4408,7 +4434,7 @@ Response includes:
 - Scene codes for BLE activation
 - Animation parameters
 
-### 9.4 Activating Scenes
+### 10.4 Activating Scenes
 
 **Via API:**
 ```json
@@ -4424,7 +4450,7 @@ Response includes:
 33 05 04 [code_low] [code_high] 00...00 [XOR]
 ```
 
-### 9.5 DIY Mode Creation
+### 10.5 DIY Mode Creation
 
 DIY modes use multi-packet BLE sequences:
 
@@ -4440,7 +4466,7 @@ DIY Styles:
 - `0x03` = Marquee
 - `0x04` = Music reactive
 
-### 9.6 SKU Segment Count Overrides
+### 10.6 SKU Segment Count Overrides
 
 The Govee API exposes RGBIC segment counts through three different shapes
 inside `devices.capabilities.segment_color_setting.parameters`:
@@ -4734,7 +4760,7 @@ Every gateway relationship observed, from `deviceSettings.gatewayInfo`:
 
 ### 13.4 AWS IoT push shapes
 
-The `state` object of a device push carried only these keys across every capture: `onOff`, `brightness`, `color`, `colorTemInKelvin`, `mode`, `sta` (`stc` string, undecoded), `result`, `wifiFuncList`. Nothing device-class-specific (no fan, toggle, sensor or segment fields) travels in `state`; that information rides as BLE-format frames in `op.command` (§6.4.1) — the H1310's `aa 31`/`aa 42`/`aa 36` fan and light frames, the H7107's `aa 1d` swing arc, the H5192's `0x24`/`0x12`/`0x0F` probe frames, and light strips' `aa 05`/`aa 13`/`aa a5` status packets all arrive that way. Since 2026.9.0 the integration attaches them to diagnostics as `last_mqtt_message._op_frames`.
+The `state` object of a device push carried only these keys across every capture: `onOff`, `brightness`, `color`, `colorTemInKelvin`, `mode`, `sta` (`stc` string, undecoded), `result`, `wifiFuncList`. Nothing device-class-specific (no fan, toggle, sensor or segment fields) travels in `state`; that information rides as BLE-format frames in `op.command` (§7.4.1) — the H1310's `aa 31`/`aa 42`/`aa 36` fan and light frames, the H7107's `aa 1d` swing arc, the H5192's `0x24`/`0x12`/`0x0F` probe frames, and light strips' `aa 05`/`aa 13`/`aa a5` status packets all arrive that way. Since 2026.9.0 the integration attaches them to diagnostics as `last_mqtt_message._op_frames`.
 
 Hub `multiSync` frames observed: header `ee 34` (16 captures — leak and thermometer sub-device reports) and `ee 35` (2 captures, #87 — the H5059 wet alarm variant).
 
